@@ -34,6 +34,9 @@
 
 static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh);
 static void __jbd2_journal_unfile_buffer(struct journal_head *jh);
+#ifdef PEXT4_JOURNAL_IO
+static int pext4_dispose_buffer(struct journal_head *jh, transaction_t *transaction);
+#endif
 
 static struct kmem_cache *transaction_cache;
 int __init jbd2_journal_init_transaction_cache(void)
@@ -942,7 +945,6 @@ repeat:
 		jh->b_next_transaction = transaction;
 	}
 
-
 	/*
 	 * Finally, if the buffer is not journaled right now, we need to make
 	 * sure it doesn't get written to disk before the caller actually
@@ -1063,15 +1065,16 @@ int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 	 * reused here.
 	 */
 	jbd_lock_bh_state(bh);
-	J_ASSERT_JH(jh, (jh->b_transaction == transaction ||
-		jh->b_transaction == NULL ||
-		(jh->b_transaction == journal->j_committing_transaction &&
-			  jh->b_jlist == BJ_Forget)));
+	//J_ASSERT_JH(jh, (jh->b_transaction == transaction ||
+	//	jh->b_transaction == NULL ||
+	//	(jh->b_transaction == journal->j_committing_transaction &&
+	//		  jh->b_jlist == BJ_Gc)));
 
 	J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
 	J_ASSERT_JH(jh, buffer_locked(jh2bh(jh)));
 
 	if (jh->b_transaction == NULL) {
+		//printk("[HJ] %s b_transaction == NULL!\n", __func__);
 		/*
 		 * Previous jbd2_journal_forget() could have left the buffer
 		 * with jbddirty bit set because it was being committed. When
@@ -1087,15 +1090,17 @@ int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 		JBUFFER_TRACE(jh, "file as BJ_Reserved");
 		spin_lock(&journal->j_list_lock);
 		__jbd2_journal_file_buffer(jh, transaction, BJ_Reserved);
-	} else if (jh->b_transaction == journal->j_committing_transaction) {
+		spin_unlock(&journal->j_list_lock);
+	} else if (jh->b_transaction == journal->j_committing_transaction) {	
+		//printk("[HJ] %s b_transaction is committing!\n", __func__);
 		/* first access by this transaction */
 		jh->b_modified = 0;
 
 		JBUFFER_TRACE(jh, "set next transaction");
 		spin_lock(&journal->j_list_lock);
 		jh->b_next_transaction = transaction;
+		spin_unlock(&journal->j_list_lock);
 	}
-	spin_unlock(&journal->j_list_lock);
 	jbd_unlock_bh_state(bh);
 
 	/*
@@ -1356,7 +1361,17 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
 
 	JBUFFER_TRACE(jh, "file as BJ_Metadata");
 	spin_lock(&journal->j_list_lock);
+#ifdef PEXT4_JOURNAL_IO
+	if (jh->b_transaction && jh->b_jlist == BJ_Reserved) {
+		__jbd2_journal_temp_unlink_buffer(jh);
+		if (test_clear_buffer_dirty(bh) || test_clear_buffer_jbddirty(bh))
+			set_buffer_jbddirty(bh);	
+	}
+	pext4_add_buffer(jh, transaction, &(transaction->t_buffers),
+			&(transaction->t_buffers_tail));
+#else
 	__jbd2_journal_file_buffer(jh, transaction, BJ_Metadata);
+#endif
 	spin_unlock(&journal->j_list_lock);
 out_unlock_bh:
 	jbd_unlock_bh_state(bh);
@@ -1431,6 +1446,7 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 		clear_buffer_jbddirty(bh);
 
 		JBUFFER_TRACE(jh, "belongs to current transaction: unfile");
+		//printk("[HJ] jbd2_journal_forget called!\n");
 
 		/*
 		 * we only want to drop a reference if this transaction
@@ -1453,10 +1469,20 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 
 		spin_lock(&journal->j_list_lock);
 		if (jh->b_cp_transaction) {
+#ifdef PEXT4_JOURNAL_IO
+			//printk("[HJ] b_cp_transaction exist!\n");
+			pext4_dispose_buffer(jh, transaction);
+#else 
 			__jbd2_journal_temp_unlink_buffer(jh);
 			__jbd2_journal_file_buffer(jh, transaction, BJ_Forget);
+#endif
 		} else {
+#ifdef PEXT4_JOURNAL_IO
+			//printk("[HJ] b_cp_transaction is not exist!\n");
+			pext4_dispose_buffer(jh, transaction);
+#else
 			__jbd2_journal_unfile_buffer(jh);
+#endif
 			if (!buffer_jbd(bh)) {
 				spin_unlock(&journal->j_list_lock);
 				jbd_unlock_bh_state(bh);
@@ -1747,8 +1773,12 @@ static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh)
 	transaction_t *transaction;
 	struct buffer_head *bh = jh2bh(jh);
 
+#ifdef PEXT4_JOURNAL_IO
+	J_ASSERT_JH(jh, (jh->b_jlist == BJ_None || jh->b_jlist == BJ_Reserved));
+#endif
 	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
 	transaction = jh->b_transaction;
+
 	if (transaction)
 		assert_spin_locked(&transaction->t_journal->j_list_lock);
 
@@ -1759,6 +1789,7 @@ static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh)
 	switch (jh->b_jlist) {
 	case BJ_None:
 		return;
+#ifndef PEXT4_JOURNAL_IO
 	case BJ_Metadata:
 		transaction->t_nr_buffers--;
 		J_ASSERT_JH(jh, transaction->t_nr_buffers >= 0);
@@ -1770,6 +1801,7 @@ static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh)
 	case BJ_Shadow:
 		list = &transaction->t_shadow_list;
 		break;
+#endif
 	case BJ_Reserved:
 		list = &transaction->t_reserved_list;
 		break;
@@ -1925,6 +1957,30 @@ busy:
  *
  * Called under jbd_lock_bh_state(bh).
  */
+
+#ifdef PEXT4_JOURNAL_IO
+static int pext4_dispose_buffer(struct journal_head *jh, transaction_t *transaction)
+{
+	struct buffer_head *bh = jh2bh(jh);
+
+	//printk("[HJ] %s test\n", __func__);
+
+	if (jh->b_removed == true)
+		return 0;
+
+	if (jh->b_jlist == BJ_Reserved)
+		__jbd2_journal_temp_unlink_buffer(jh);
+
+	clear_buffer_dirty(bh);
+	clear_buffer_jbddirty(bh);
+
+	pext4_del_buffer(jh, transaction, 
+		&transaction->t_gc_head,
+		&transaction->t_gc_tail);
+
+	return 0;
+}
+#else
 static int __dispose_buffer(struct journal_head *jh, transaction_t *transaction)
 {
 	int may_free = 1;
@@ -1947,7 +2003,7 @@ static int __dispose_buffer(struct journal_head *jh, transaction_t *transaction)
 	}
 	return may_free;
 }
-
+#endif
 /*
  * jbd2_journal_invalidatepage
  *
@@ -2053,6 +2109,7 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 		 * if it hits disk safely. */
 		if (!jh->b_cp_transaction) {
 			JBUFFER_TRACE(jh, "not on any transaction: zap");
+
 			goto zap_buffer;
 		}
 
@@ -2069,9 +2126,13 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 			/* ... and once the current transaction has
 			 * committed, the buffer won't be needed any
 			 * longer. */
+#ifdef PEXT4_JOURNAL_IO
+			may_free = pext4_dispose_buffer(jh, journal->j_running_transaction);
+#else
 			JBUFFER_TRACE(jh, "checkpointed: add to BJ_Forget");
 			may_free = __dispose_buffer(jh,
 					journal->j_running_transaction);
+#endif
 			goto zap_buffer;
 		} else {
 			/* There is no currently-running transaction. So the
@@ -2079,9 +2140,13 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 			 * passed into commit.  We must attach this buffer to
 			 * the committing transaction, if it exists. */
 			if (journal->j_committing_transaction) {
-				JBUFFER_TRACE(jh, "give to committing trans");
+#ifdef PEXT4_JOURNAL_IO
+				may_free = pext4_dispose_buffer(jh, journal->j_committing_transaction);
+#else
+				JBUFFER_TRACE(jh, "give to committing trans");			
 				may_free = __dispose_buffer(jh,
 					journal->j_committing_transaction);
+#endif
 				goto zap_buffer;
 			} else {
 				/* The orphan record's transaction has
@@ -2111,8 +2176,14 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 		 * should clear dirty bits when it is done with the buffer.
 		 */
 		set_buffer_freed(bh);
+	
+		//printk("[HJ] %s called\n", __func__);
+#ifdef PEXT4_JOURNAL_IO
+		__sync_lock_test_and_set(&jh->b_removed, true);
+#endif
 		if (journal->j_running_transaction && buffer_jbddirty(bh))
 			jh->b_next_transaction = journal->j_running_transaction;
+	
 		jbd2_journal_put_journal_head(jh);
 		spin_unlock(&journal->j_list_lock);
 		jbd_unlock_bh_state(bh);
@@ -2127,7 +2198,11 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 		 * expose the disk blocks we are discarding here.) */
 		J_ASSERT_JH(jh, transaction == journal->j_running_transaction);
 		JBUFFER_TRACE(jh, "on running transaction");
+#ifdef PEXT4_JOURNAL_IO
+		may_free = pext4_dispose_buffer(jh, transaction);
+#else
 		may_free = __dispose_buffer(jh, transaction);
+#endif
 	}
 
 zap_buffer:
@@ -2234,6 +2309,9 @@ void __jbd2_journal_file_buffer(struct journal_head *jh,
 	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
 	assert_spin_locked(&transaction->t_journal->j_list_lock);
 
+#ifdef PEXT4_JOURNAL_IO
+	J_ASSERT_JH(jh, (jh->b_jlist == BJ_None || jh->b_jlist == BJ_Reserved));
+#endif
 	J_ASSERT_JH(jh, jh->b_jlist < BJ_Types);
 	J_ASSERT_JH(jh, jh->b_transaction == transaction ||
 				jh->b_transaction == NULL);
@@ -2241,8 +2319,12 @@ void __jbd2_journal_file_buffer(struct journal_head *jh,
 	if (jh->b_transaction && jh->b_jlist == jlist)
 		return;
 
+#ifdef PEXT4_JOURNAL_IO
+	if (jlist == BJ_Reserved) {
+#else
 	if (jlist == BJ_Metadata || jlist == BJ_Reserved ||
 	    jlist == BJ_Shadow || jlist == BJ_Forget) {
+#endif
 		/*
 		 * For metadata buffers, we track dirty bit in buffer_jbddirty
 		 * instead of buffer_dirty. We should not see a dirty bit set
@@ -2268,6 +2350,7 @@ void __jbd2_journal_file_buffer(struct journal_head *jh,
 		J_ASSERT_JH(jh, !jh->b_committed_data);
 		J_ASSERT_JH(jh, !jh->b_frozen_data);
 		return;
+#ifndef PEXT4_JOURNAL_IO
 	case BJ_Metadata:
 		transaction->t_nr_buffers++;
 		list = &transaction->t_buffers;
@@ -2278,6 +2361,7 @@ void __jbd2_journal_file_buffer(struct journal_head *jh,
 	case BJ_Shadow:
 		list = &transaction->t_shadow_list;
 		break;
+#endif
 	case BJ_Reserved:
 		list = &transaction->t_reserved_list;
 		break;
@@ -2311,6 +2395,51 @@ void jbd2_journal_file_buffer(struct journal_head *jh,
  *
  * jh and bh may be already free when this function returns
  */
+#ifdef PEXT4_JOURNAL_IO
+void __jbd2_journal_refile_buffer(struct journal_head *jh)
+{
+	int was_dirty;
+	struct buffer_head *bh = jh2bh(jh);
+
+	J_ASSERT_JH(jh, jbd_is_locked_bh_state(bh));
+	if (jh->b_transaction)
+		assert_spin_locked(&jh->b_transaction->t_journal->j_list_lock);
+
+	/* If the buffer is now unused, just drop it. */
+	if (jh->b_next_transaction == NULL) {
+		__jbd2_journal_unfile_buffer(jh);
+		return;
+	}
+
+	/*
+	 * It has been modified by a later transaction: add it to the new
+	 * transaction's metadata list.
+	 */
+
+	was_dirty = test_clear_buffer_jbddirty(bh);
+	__jbd2_journal_temp_unlink_buffer(jh);
+	/*
+	 * We set b_transaction here because b_next_transaction will inherit
+	 * our jh reference and thus __jbd2_journal_file_buffer() must not
+	 * take a new one.
+	 */
+	jh->b_transaction = jh->b_next_transaction;
+	jh->b_next_transaction = NULL;
+	if (jh->b_removed == true) {
+		//printk("[HJ] Removed journal head is appeared at t_reserved!\n");
+		return;
+	} else if (jh->b_modified) {
+		pext4_add_buffer(jh, jh->b_transaction, &(jh->b_transaction->t_buffers),
+			&(jh->b_transaction->t_buffers_tail));
+	} else {
+		__jbd2_journal_file_buffer(jh, jh->b_transaction, BJ_Reserved);
+		J_ASSERT_JH(jh, jh->b_transaction->t_state == T_RUNNING);
+	}
+
+	if (was_dirty)
+		set_buffer_jbddirty(bh);
+}
+#else
 void __jbd2_journal_refile_buffer(struct journal_head *jh)
 {
 	int was_dirty, jlist;
@@ -2352,6 +2481,9 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 	if (was_dirty)
 		set_buffer_jbddirty(bh);
 }
+#endif
+
+
 
 /*
  * __jbd2_journal_refile_buffer() with necessary locking added. We take our
@@ -2436,6 +2568,37 @@ done:
 
 	return 0;
 }
+
+
+#ifdef PEXT4_JOURNAL_IO
+void pext4_add_buffer (struct journal_head *jh, transaction_t *transaction,
+			struct journal_head **head, struct journal_head **tail)
+{
+	jh->b_transaction = transaction;
+	/* Insert jh to t_buffers using atomic_set built-in instruction.*/
+	jh->b_tprev = __sync_lock_test_and_set(tail, jh);
+	/* Reset jh's tnext to NULL because insert is always occured at tail.	 */
+	jh->b_tnext = NULL;
+	jh->b_jlist = BJ_Metadata;
+	if (jh->b_tprev == NULL)
+		*head = jh;
+	else
+		jh->b_tprev->b_tnext = jh;
+}
+
+void pext4_del_buffer (struct journal_head *jh, transaction_t *transaction,
+			struct journal_head **head, struct journal_head **tail)
+{
+	__sync_lock_test_and_set (&jh->b_removed, true);
+	jh->b_gc_prev = __sync_lock_test_and_set (tail, jh);
+	if (jh->b_gc_prev == NULL)
+		*head = jh;
+	else
+		jh->b_gc_prev->b_gc_next = jh;	
+	jh->b_jlist = BJ_Gc;
+}
+#endif
+
 
 /*
  * File truncate and transaction commit interact with each other in a

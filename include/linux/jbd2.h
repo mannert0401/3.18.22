@@ -546,12 +546,35 @@ struct transaction_s
 	 */
 	struct journal_head	*t_buffers;
 
+#ifdef PEXT4_JOURNAL_IO
+
+	/*
+	 * t_buffers' tail. It needs at implementation of PEXT4's lock free list.
+	 *
+	 * -Hojin Nam.
+	 */
+	struct journal_head	*t_buffers_tail;
+
+	/*
+	 * Doubly-linked list of logically removed journal heads.
+	 * Journal heads which is containing in this list freed 
+	 * by application thread which is the last among joinning checkpoint.
+	 *
+	 * -Hojin Nam.
+	 */
+	struct journal_head	*t_gc_head;
+
+	struct journal_head	*t_gc_tail;
+#endif
+
+#ifndef PEXT4_JOURNAL_IO
 	/*
 	 * Doubly-linked circular list of all forget buffers (superseded
 	 * buffers which we can un-checkpoint once this transaction commits)
 	 * [j_list_lock]
 	 */
 	struct journal_head	*t_forget;
+#endif
 
 	/*
 	 * Doubly-linked circular list of all buffers still to be flushed before
@@ -565,12 +588,14 @@ struct transaction_s
 	 */
 	struct journal_head	*t_checkpoint_io_list;
 
+#ifndef PEXT4_JOURNAL_IO
 	/*
 	 * Doubly-linked circular list of metadata buffers being shadowed by log
 	 * IO.  The IO buffers on the iobuf list and the shadow buffers on this
 	 * list match each other one for one at all times. [j_list_lock]
 	 */
 	struct journal_head	*t_shadow_list;
+#endif
 
 	/*
 	 * List of inodes whose data we've modified in data=ordered mode.
@@ -652,12 +677,39 @@ struct transaction_s
 	 */
 	struct list_head	t_private_list;
 
-#ifdef OEXT4
+	/*
+	 * When transaction starts commit, JBD thread sets t_journal_io start(true).
+	 * When transaction starts checkpoint, t_cp_io also sets start by application thread.
+	 * Functions that issue i/o(.e.g, journal_io_start(), jbd2_log_wait_for_space())
+	 * determine whether to proceed by looking at these flags.
+	 * 
+	 * -Hojin Nam.
+	 */
+#ifdef PEXT4_JOURNAL_IO
 	bool			t_journal_io;
+#endif
 
+
+#ifdef PEXT4_CP_IO
 	bool			t_cp_io;
+#endif
 
-	int			num_io_threads;
+	/*
+	 * In PEXT4, i/o submits by the multiple threads. 
+	 * To perserve ordering at commit, PEXT4 count the number of threads joinning commit process.
+	 * When the t_num_io_threads is 0, JBD2 thread submits commit record and finishes commit process.
+	 * In case of checkpoint application thread check t_num_cp_io_threads.
+	 * If t_num_cp_io_threads is 0, then the application finishes checkpoint process.
+	 *
+	 * -Hojin Nam.
+	 */
+#ifdef PEXT4_JOURNAL_IO
+	int			t_num_io_threads;
+#endif
+
+
+#ifdef PEXT4_CP_IO
+	int			t_num_cp_io_threads;
 #endif
 };
 
@@ -1038,6 +1090,18 @@ static inline void jbd2_unfile_log_bh(struct buffer_head *bh)
 	list_del_init(&bh->b_assoc_buffers);
 }
 
+#ifdef PEXT4_JOURNAL_IO
+extern void pext4_add_buffer(struct journal_head *jh, 
+			transaction_t *transaction,
+			struct journal_head **head,
+			struct journal_head **tail);
+extern void pext4_del_buffer(struct journal_head *jh, 
+			transaction_t *transaction,
+			struct journal_head **head,
+			struct journal_head **tail);
+#endif
+
+
 /* Log buffer allocation */
 struct buffer_head *jbd2_journal_get_descriptor_buffer(journal_t *journal);
 int jbd2_journal_next_log_block(journal_t *, unsigned long long *);
@@ -1047,8 +1111,11 @@ int __jbd2_update_log_tail(journal_t *journal, tid_t tid, unsigned long block);
 void jbd2_update_log_tail(journal_t *journal, tid_t tid, unsigned long block);
 
 /* Commit management */
+#ifdef PEXT4_JOURNAL_IO
+extern void jbd2_journal_pext4_commit_transaction(journal_t *);
+#else
 extern void jbd2_journal_commit_transaction(journal_t *);
-
+#endif
 /* Checkpoint list management */
 void __jbd2_journal_clean_checkpoint_list(journal_t *journal);
 int __jbd2_journal_remove_checkpoint(struct journal_head *);
@@ -1368,7 +1435,9 @@ static inline unsigned long jbd2_log_space_left(journal_t *journal)
 #define BJ_Forget	2	/* Buffer superseded by this transaction */
 #define BJ_Shadow	3	/* Buffer contents being shadowed to the log */
 #define BJ_Reserved	4	/* Buffer is reserved for access by journal */
-#define BJ_Types	5
+#define BJ_Gc		5
+#define BJ_Types	6
+
 
 extern int jbd_blocks_per_page(struct inode *inode);
 

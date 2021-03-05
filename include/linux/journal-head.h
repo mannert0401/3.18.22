@@ -13,7 +13,7 @@
 typedef unsigned int		tid_t;		/* Unique transaction ID */
 typedef struct transaction_s	transaction_t;	/* Compound transaction type */
 
-
+#define PEXT4_JOURNAL_IO
 #define OEXT4
 
 
@@ -105,11 +105,21 @@ struct journal_head {
 	/* Trigger type for the committing transaction's frozen data */
 	struct jbd2_buffer_trigger_type *b_frozen_triggers;
 
-#ifdef OEXT4
-	struct journal_head * gc_prev;
+#ifdef PEXT4_JOURNAL_IO
+	/*
+	 * Pointer to the transaction's gc_list. 
+	 * It only connected with gc list when jh is logically removed.
+	 * 
+	 * -Hojin Nam.
+	 */
+	struct journal_head * b_gc_prev;
 
-	struct journal_head * gc_next;
+	struct journal_head * b_gc_next;
 	
+	/*
+	 * Flags to check logcal remove. If this flags is true,
+	 * this journal head is logically removed.
+	 */
 	bool	b_removed;
 #endif
 };

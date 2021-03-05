@@ -3204,7 +3204,11 @@ static int set_journal_csum_feature_set(struct super_block *sb)
 	if (ext4_has_metadata_csum(sb)) {
 		/* journal checksum v3 */
 		compat = 0;
+#ifdef PEXT4_JOURNAL_IO
+		incompat = 0;
+#else
 		incompat = JBD2_FEATURE_INCOMPAT_CSUM_V3;
+#endif
 	} else {
 		/* journal checksum v1 */
 		compat = JBD2_FEATURE_COMPAT_CHECKSUM;

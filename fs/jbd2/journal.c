@@ -220,7 +220,11 @@ loop:
 		jbd_debug(1, "OK, requests differ\n");
 		write_unlock(&journal->j_state_lock);
 		del_timer_sync(&journal->j_commit_timer);
+#ifdef PEXT4_JOURNAL_IO
+		jbd2_journal_pext4_commit_transaction(journal);
+#else
 		jbd2_journal_commit_transaction(journal);
+#endif
 		write_lock(&journal->j_state_lock);
 		goto loop;
 	}
@@ -481,10 +485,12 @@ repeat:
 	 * and the original buffer whose contents we are shadowing or
 	 * copying is moved to the transaction's shadow queue.
 	 */
+#ifndef PEXT4_JOURNAL_IO
 	JBUFFER_TRACE(jh_in, "file as BJ_Shadow");
 	spin_lock(&journal->j_list_lock);
 	__jbd2_journal_file_buffer(jh_in, transaction, BJ_Shadow);
 	spin_unlock(&journal->j_list_lock);
+#endif
 	set_buffer_shadow(bh_in);
 	jbd_unlock_bh_state(bh_in);
 
@@ -712,8 +718,12 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 				  tid, journal->j_commit_sequence);
 		read_unlock(&journal->j_state_lock);
 		wake_up(&journal->j_wait_commit);
+#ifdef PEXT_JOURNAL_IO
+		journal_io_start(journal);	
+#else
 		wait_event(journal->j_wait_done_commit,
 				!tid_gt(tid, journal->j_commit_sequence));
+#endif
 		read_lock(&journal->j_state_lock);
 	}
 	read_unlock(&journal->j_state_lock);
@@ -1698,8 +1708,13 @@ int jbd2_journal_destroy(journal_t *journal)
 	journal_kill_thread(journal);
 
 	/* Force a final log commit */
-	if (journal->j_running_transaction)
+	if (journal->j_running_transaction) {
+#ifdef PEXT4_JOURNAL_IO
+		jbd2_journal_pext4_commit_transaction(journal);
+#else
 		jbd2_journal_commit_transaction(journal);
+#endif
+	}
 
 	/* Force any old transactions to disk */
 

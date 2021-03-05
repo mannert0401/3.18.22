@@ -25,6 +25,9 @@
 #include <linux/blkdev.h>
 #include <trace/events/jbd2.h>
 
+
+
+
 /*
  * Unlink a buffer from a transaction checkpoint list.
  *
@@ -248,6 +251,8 @@ restart:
 	    transaction->t_tid != this_tid)
 		goto out;
 
+	//printk("[HJ] %s test\n", __func__);
+
 	/* checkpoint all of the transaction's buffers */
 	while (transaction->t_checkpoint_list) {
 		jh = transaction->t_checkpoint_list;
@@ -357,7 +362,10 @@ restart2:
 			break;
 	}
 out:
+
 	spin_unlock(&journal->j_list_lock);
+
+
 	if (result < 0)
 		jbd2_journal_abort(journal, result);
 	else
@@ -529,6 +537,9 @@ int __jbd2_journal_remove_checkpoint(struct journal_head *jh)
 	transaction_t *transaction;
 	journal_t *journal;
 	int ret = 0;
+#ifdef PEXT4_JOURNAL_IO
+	struct buffer_head *bh;
+#endif
 
 	JBUFFER_TRACE(jh, "entry");
 
@@ -558,6 +569,7 @@ int __jbd2_journal_remove_checkpoint(struct journal_head *jh)
 	 */
 	if (transaction->t_state != T_FINISHED)
 		goto out;
+
 
 	/* OK, that was the last buffer for the transaction: we can now
 	   safely remove this transaction from the log */
@@ -628,10 +640,13 @@ void __jbd2_journal_drop_transaction(journal_t *journal, transaction_t *transact
 			journal->j_checkpoint_transactions = NULL;
 	}
 
+
 	J_ASSERT(transaction->t_state == T_FINISHED);
 	J_ASSERT(transaction->t_buffers == NULL);
+#ifndef PEXT4_JOURNAL_IO
 	J_ASSERT(transaction->t_forget == NULL);
 	J_ASSERT(transaction->t_shadow_list == NULL);
+#endif
 	J_ASSERT(transaction->t_checkpoint_list == NULL);
 	J_ASSERT(transaction->t_checkpoint_io_list == NULL);
 	J_ASSERT(atomic_read(&transaction->t_updates) == 0);
