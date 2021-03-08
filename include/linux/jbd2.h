@@ -1113,6 +1113,7 @@ void jbd2_update_log_tail(journal_t *journal, tid_t tid, unsigned long block);
 /* Commit management */
 #ifdef PEXT4_JOURNAL_IO
 extern void jbd2_journal_pext4_commit_transaction(journal_t *);
+extern void journal_io_start (journal_t *journal); 
 #else
 extern void jbd2_journal_commit_transaction(journal_t *);
 #endif

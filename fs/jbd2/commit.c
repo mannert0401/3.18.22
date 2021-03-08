@@ -1336,25 +1336,30 @@ void journal_io_start (journal_t *journal)
 	int flags;
 	int err;
 
-	//printk("[HJ] %s is called!\n", __func__);
 
 	/* Check whether comtting transaction is existing. */
-	if ((transaction = journal->j_committing_transaction) == NULL)
+
+	if ((transaction = journal->j_committing_transaction) == NULL) {
 		return;
+	}
 	/* 
 	 * Check whether this thread can join at journal I/O process.
 	 * If the comitting transaction is not starting I/O submission,
 	 * return without joinning journal I/O process.
 	 */
-	if (transaction->t_journal_io == false) 
+	smp_mb();
+	if (transaction->t_journal_io == false) {
 		return;
+	}
 	
 	/* 
 	 * Increase t_num_io_threads using  built-in atomic_set() function.
 	 */
 	__sync_add_and_fetch (&(transaction->t_num_io_threads), 1);
-
-
+	/*
+	if (transaction->t_num_io_threads > 1)
+		printk("[HJ] increase t_num_io_threads : %d\n", transaction->t_num_io_threads);
+	*/
 	/*
 	 * Issue journal I/O traversing t_buffers.
 	 */
@@ -1454,7 +1459,6 @@ void jbd2_journal_pext4_commit_transaction(journal_t *journal)
 	int temp;
 	int try_to_free = 0;
 	int was_dirty;
-	//printk("[HJ] %s check\n", __func__);
 
 	temp = jbd2_journal_has_csum_v2or3(journal);
 	if (temp) 
@@ -1694,7 +1698,10 @@ void jbd2_journal_pext4_commit_transaction(journal_t *journal)
 
 	__sync_lock_test_and_set (&(commit_transaction->t_journal_io),true);
 	journal_io_start(journal);
-	while(commit_transaction->t_num_io_threads != 0);
+	smp_mb();
+	while(commit_transaction->t_num_io_threads != 0) {
+		smp_mb();
+	}
 
 
 	write_lock(&journal->j_state_lock);

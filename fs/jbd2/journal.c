@@ -718,12 +718,11 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 				  tid, journal->j_commit_sequence);
 		read_unlock(&journal->j_state_lock);
 		wake_up(&journal->j_wait_commit);
-#ifdef PEXT_JOURNAL_IO
-		journal_io_start(journal);	
-#else
+#ifdef PEXT4_JOURNAL_IO
+		journal_io_start(journal);
+#endif
 		wait_event(journal->j_wait_done_commit,
 				!tid_gt(tid, journal->j_commit_sequence));
-#endif
 		read_lock(&journal->j_state_lock);
 	}
 	read_unlock(&journal->j_state_lock);
