@@ -1335,6 +1335,7 @@ void journal_io_start (journal_t *journal)
 	struct journal_head *jh;
 	int flags;
 	int err;
+	struct blk_plug plug;
 
 
 	/* Check whether comtting transaction is existing. */
@@ -1363,6 +1364,7 @@ void journal_io_start (journal_t *journal)
 	/*
 	 * Issue journal I/O traversing t_buffers.
 	 */
+	blk_start_plug(&plug);
 	while ((jh = transaction->t_buffers) != NULL) {
 
 		/*
@@ -1434,7 +1436,7 @@ void journal_io_start (journal_t *journal)
 		frozen_bh->b_end_io = journal_end_buffer_io_sync;
 		submit_bh(WRITE_SYNC, frozen_bh);	
 	}
-
+	blk_finish_plug(&plug);
 	__sync_lock_test_and_set(&(transaction->t_journal_io), false);
 	wait_journal_io(&local_wait_list);
 	__sync_sub_and_fetch (&(transaction->t_num_io_threads), 1);
