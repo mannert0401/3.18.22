@@ -77,10 +77,10 @@ MODULE_PARM_DESC(mballoc_debug, "Debugging level for ext4's mballoc");
  * spaces for this particular inode. The inode prealloc space is
  * represented as:
  *
- * pa_lstart -> the logical start block for this prealloc space
- * pa_pstart -> the physical start block for this prealloc space
- * pa_len    -> length for this prealloc space (in clusters)
- * pa_free   ->  free space available in this prealloc space (in clusters)
+ * pa_lstart->the logical start block for this prealloc space
+ * pa_pstart->the physical start block for this prealloc space
+ * pa_len   ->length for this prealloc space (in clusters)
+ * pa_free  -> free space available in this prealloc space (in clusters)
  *
  * The inode preallocation space is used looking at the _logical_ start
  * block. If only the logical file block falls within the range of prealloc
@@ -4801,12 +4801,18 @@ do_more:
 		/*
 		 * blocks being freed are metadata. these blocks shouldn't
 		 * be used until this transaction is committed
-		 *
-		 * We use __GFP_NOFAIL because ext4_free_blocks() is not allowed
-		 * to fail.
 		 */
-		new_entry = kmem_cache_alloc(ext4_free_data_cachep,
-				GFP_NOFS|__GFP_NOFAIL);
+	retry:
+		new_entry = kmem_cache_alloc(ext4_free_data_cachep, GFP_NOFS);
+		if (!new_entry) {
+			/*
+			 * We use a retry loop because
+			 * ext4_free_blocks() is not allowed to fail.
+			 */
+			cond_resched();
+			congestion_wait(BLK_RW_ASYNC, HZ/50);
+			goto retry;
+		}
 		new_entry->efd_start_cluster = bit;
 		new_entry->efd_group = block_group;
 		new_entry->efd_count = count_clusters;

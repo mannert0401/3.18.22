@@ -810,9 +810,25 @@ do {									       \
 
 #include "extents_status.h"
 
+struct eext4_entry_arg {
+	__u32	pinode;
+	__u32	inode;
+	__u8	tagged;
+	__u8	device_mask;
+
+	/*the flag variable indicates whether the arg package passed in is already filled with the corresponding args,
+	  *If so, eext4_add_entry can use them directly,
+	  *Otherwise the fields should be computed;
+	  */
+	__u16	filled;
+};
+
 /*
  * fourth extended file system inode data in memory
  */
+ 
+ 
+ 
 struct ext4_inode_info {
 	__le32	i_data[15];	/* unconverted */
 	__u32	i_dtime;
@@ -943,6 +959,14 @@ struct ext4_inode_info {
 
 	/* Precomputed uuid+inum+igen checksum for seeding inode checksums */
 	__u32 i_csum_seed;
+	struct eext4_entry_arg	eext4_addr;
+	/* store the span inode */
+	void  *i_spandir;
+	unsigned i_rr_counter;
+	unsigned long i_state;
+	int i_tid;
+	
+	
 };
 
 /*
@@ -1161,8 +1185,11 @@ struct ext4_super_block {
 	__le32	s_grp_quota_inum;	/* inode for tracking group quota */
 	__le32	s_overhead_clusters;	/* overhead blocks/clusters in fs */
 	__le32	s_backup_bgs[2];	/* groups with sparse_super2 SBs */
-	__le32	s_reserved[106];	/* Padding to the end of the block */
+	__le32	s_reserved[105];	/* Padding to the end of the block */
 	__le32	s_checksum;		/* crc32c(superblock) */
+
+	// dulian: stole 4 bytes from s_reserved
+	__le32	next_sb_blk;
 };
 
 #define EXT4_S_ERR_LEN (EXT4_S_ERR_END - EXT4_S_ERR_START)
@@ -1342,6 +1369,9 @@ struct ext4_sb_info {
 	struct ratelimit_state s_err_ratelimit_state;
 	struct ratelimit_state s_warning_ratelimit_state;
 	struct ratelimit_state s_msg_ratelimit_state;
+	
+	/*added by eext4, to indicate the sequence identifier of each ext4_sb_info, and each device*/
+	__u8  eext4_sb_info_id;
 };
 
 static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)
@@ -1389,6 +1419,30 @@ static inline void ext4_inode_aio_set(struct inode *inode, ext4_io_end_t *io)
 {
 	inode->i_private = io;
 }
+
+
+#define ENTRY_NEW	1
+#define ENTRY_PERSISTENT 3
+#define ENTRY_COMMITTED		5
+ 
+ static inline int spanfs_test_inode_state(struct inode *inode, int bit)  
+ {									 
+	 return test_bit(bit, &EXT4_I(inode)->i_state); 
+ }	
+
+ static inline int spanfs_test_and_clear_inode_state(struct inode *inode, int bit)  
+ {									 
+	 return test_and_clear_bit(bit, &EXT4_I(inode)->i_state); 
+ }		
+
+ static inline void spanfs_set_inode_state(struct inode *inode, int bit)  
+ {									 
+	 set_bit(bit, &EXT4_I(inode)->i_state);	 
+ }									 
+ static inline void spanfs_clear_inode_state(struct inode *inode, int bit) 
+ {									 
+	 clear_bit(bit, &EXT4_I(inode)->i_state);		 
+ }
 
 /*
  * Inode dynamic state flags
@@ -1620,6 +1674,7 @@ static inline void ext4_clear_state_flags(struct ext4_inode_info *ei)
 #define EXT4_NAME_LEN 255
 
 struct ext4_dir_entry {
+	__le32	pinode;			/*bug arises when this definition is not unified*/
 	__le32	inode;			/* Inode number */
 	__le16	rec_len;		/* Directory entry length */
 	__le16	name_len;		/* Name length */
@@ -1633,10 +1688,12 @@ struct ext4_dir_entry {
  * file_type field.
  */
 struct ext4_dir_entry_2 {
+	__le32	pinode;
 	__le32	inode;			/* Inode number */
 	__le16	rec_len;		/* Directory entry length */
 	__u8	name_len;		/* Name length */
 	__u8	file_type;
+	__u8	device_mask;		/* the serial number of the device storing the actual object; */
 	char	name[EXT4_NAME_LEN];	/* File name */
 };
 
@@ -1681,7 +1738,7 @@ struct ext4_dir_entry_tail {
  */
 #define EXT4_DIR_PAD			4
 #define EXT4_DIR_ROUND			(EXT4_DIR_PAD - 1)
-#define EXT4_DIR_REC_LEN(name_len)	(((name_len) + 8 + EXT4_DIR_ROUND) & \
+#define EXT4_DIR_REC_LEN(name_len)	(((name_len) + 13 + EXT4_DIR_ROUND) & \
 					 ~EXT4_DIR_ROUND)
 #define EXT4_MAX_REC_LEN		((1<<16)-1)
 
@@ -2024,6 +2081,7 @@ static unsigned char ext4_filetype_table[] = {
 
 static inline  unsigned char get_dtype(struct super_block *sb, int filetype)
 {
+	filetype &= 0x0f;
 	if (!EXT4_HAS_INCOMPAT_FEATURE(sb, EXT4_FEATURE_INCOMPAT_FILETYPE) ||
 	    (filetype >= EXT4_FT_MAX))
 		return DT_UNKNOWN;
@@ -2164,13 +2222,15 @@ extern int ext4_orphan_add(handle_t *, struct inode *);
 extern int ext4_orphan_del(handle_t *, struct inode *);
 extern int ext4_htree_fill_tree(struct file *dir_file, __u32 start_hash,
 				__u32 start_minor_hash, __u32 *next_hash);
+
 extern int search_dir(struct buffer_head *bh,
 		      char *search_buf,
 		      int buf_size,
 		      struct inode *dir,
 		      const struct qstr *d_name,
 		      unsigned int offset,
-		      struct ext4_dir_entry_2 **res_dir);
+		      struct ext4_dir_entry_2 **res_dir,
+		      int local_or_remote);
 extern int ext4_generic_delete_entry(handle_t *handle,
 				     struct inode *dir,
 				     struct ext4_dir_entry_2 *de_del,
@@ -2617,6 +2677,8 @@ extern int ext4_da_write_inline_data_end(struct inode *inode, loff_t pos,
 					 struct page *page);
 extern int ext4_try_add_inline_entry(handle_t *handle, struct dentry *dentry,
 				     struct inode *inode);
+extern int ext4_try_add_inline_entry_with_span(handle_t *handle, struct dentry *dentry,
+				     struct inode *inode, struct inode *spandir);
 extern int ext4_try_create_inline_dir(handle_t *handle,
 				      struct inode *parent,
 				      struct inode *inode);
@@ -2628,10 +2690,13 @@ extern int htree_inlinedir_to_tree(struct file *dir_file,
 				   struct dx_hash_info *hinfo,
 				   __u32 start_hash, __u32 start_minor_hash,
 				   int *has_inline_data);
+
+
 extern struct buffer_head *ext4_find_inline_entry(struct inode *dir,
 					const struct qstr *d_name,
 					struct ext4_dir_entry_2 **res_dir,
-					int *has_inline_data);
+					int *has_inline_data,
+					int local_or_remote);
 extern int ext4_delete_inline_entry(handle_t *handle,
 				    struct inode *dir,
 				    struct ext4_dir_entry_2 *de_del,
@@ -2660,6 +2725,7 @@ static inline int ext4_has_inline_data(struct inode *inode)
 /* namei.c */
 extern const struct inode_operations ext4_dir_inode_operations;
 extern const struct inode_operations ext4_special_inode_operations;
+extern const struct dentry_operations eext4_dentry_operations;
 extern struct dentry *ext4_get_parent(struct dentry *child);
 extern struct ext4_dir_entry_2 *ext4_init_dot_dotdot(struct inode *inode,
 				 struct ext4_dir_entry_2 *de,

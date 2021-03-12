@@ -1,6 +1,7 @@
 /*
  *  linux/fs/ext4/super.c
  *
+ *
  * Copyright (C) 1992, 1993, 1994, 1995
  * Remy Card (card@masi.ibp.fr)
  * Laboratoire MASI - Institut Blaise Pascal
@@ -14,6 +15,12 @@
  *
  *  Big-endian to little-endian byte-swapping/bitmaps by
  *        David S. Miller (davem@caip.rutgers.edu), 1995
+ *
+ *
+ * Implement SpanFS based on Ext4.
+ * Copyright (C) 2013-2016  Junbin Kang <kangjb@act.buaa.edu.cn>, Benlong Zhang <zblgeqian@gmail.com>, Lian Du <dulian@act.buaa.edu.cn>.
+ * Beihang University
+ * 
  */
 
 #include <linux/module.h>
@@ -41,6 +48,11 @@
 #include <linux/cleancache.h>
 #include <asm/uaccess.h>
 
+#include <linux/file.h>
+#include <linux/path.h>
+#include <linux/wait.h>
+
+
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 
@@ -51,8 +63,20 @@
 #include "acl.h"
 #include "mballoc.h"
 
+#include "eext4.h"
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/ext4.h>
+
+/* added by eext4 upon ext4 */
+int EEXT4_ONLINE_DEVICE_NUM;
+int EEXT4_START_DEVICE_NUM;
+int CPU_CORE_NUM;
+
+struct dentry* eext4_rd_uvlroot;
+unsigned int round_robin_counter = 0;
+
+struct eext4_device	*eext4_devices[EEXT4_DEVICE_NUM_MAX];
 
 static struct proc_dir_entry *ext4_proc_root;
 static struct kset *ext4_kset;
@@ -831,7 +855,6 @@ static void ext4_put_super(struct super_block *sb)
 		dump_orphan_list(sb, sbi);
 	J_ASSERT(list_empty(&sbi->s_orphan));
 
-	sync_blockdev(sb->s_bdev);
 	invalidate_bdev(sb->s_bdev);
 	if (sbi->journal_bdev && sbi->journal_bdev != sb->s_bdev) {
 		/*
@@ -903,6 +926,15 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
 	atomic_set(&ei->i_unwritten, 0);
 	INIT_WORK(&ei->i_rsv_conversion_work, ext4_end_io_rsv_work);
 
+	ei->i_spandir = NULL;
+	ei->i_rr_counter = task_cpu(current);
+	ei->i_state = 0;
+	spanfs_set_inode_state(&ei->vfs_inode,ENTRY_NEW);
+	spanfs_clear_inode_state(&ei->vfs_inode, ENTRY_PERSISTENT);
+	spanfs_clear_inode_state(&ei->vfs_inode, ENTRY_COMMITTED);
+	ei->i_tid = -1;
+	
+	
 	return &ei->vfs_inode;
 }
 
@@ -942,6 +974,10 @@ static void init_once(void *foo)
 	init_rwsem(&ei->xattr_sem);
 	init_rwsem(&ei->i_data_sem);
 	inode_init_once(&ei->vfs_inode);
+	ei->i_spandir = NULL;
+	ei->i_rr_counter = task_cpu(current);
+	
+	
 }
 
 static int __init init_inodecache(void)
@@ -980,6 +1016,7 @@ void ext4_clear_inode(struct inode *inode)
 		jbd2_free_inode(EXT4_I(inode)->jinode);
 		EXT4_I(inode)->jinode = NULL;
 	}
+	
 }
 
 static struct inode *ext4_nfs_get_inode(struct super_block *sb,
@@ -1031,6 +1068,7 @@ static struct dentry *ext4_fh_to_parent(struct super_block *sb, struct fid *fid,
  * which would prevent try_to_free_buffers() from freeing them, we must use
  * jbd2 layer's try_to_free_buffers() function to release them.
  */
+
 static int bdev_try_to_free_page(struct super_block *sb, struct page *page,
 				 gfp_t wait)
 {
@@ -1121,6 +1159,7 @@ static const struct super_operations ext4_sops = {
 #endif
 	.bdev_try_to_free_page = bdev_try_to_free_page,
 };
+
 
 static const struct export_operations ext4_export_ops = {
 	.fh_to_dentry = ext4_fh_to_dentry,
@@ -3392,14 +3431,16 @@ static int ext4_reserve_clusters(struct ext4_sb_info *sbi, ext4_fsblk_t count)
 	return 0;
 }
 
+ext4_fsblk_t sb_block = 0; // calculated in 1KB block size
+
 static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 {
-	char *orig_data = kstrdup(data, GFP_KERNEL);
+	char *orig_data;
 	struct buffer_head *bh;
 	struct ext4_super_block *es = NULL;
 	struct ext4_sb_info *sbi;
 	ext4_fsblk_t block;
-	ext4_fsblk_t sb_block = get_sb_block(&data);
+	//ext4_fsblk_t sb_block;
 	ext4_fsblk_t logical_sb_block;
 	unsigned long offset = 0;
 	unsigned long journal_devnum = 0;
@@ -3417,6 +3458,12 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	unsigned int journal_ioprio = DEFAULT_JOURNAL_IOPRIO;
 	ext4_group_t first_not_zeroed;
 
+
+	eext4_warning("enter ext4 fill super\n");
+
+	orig_data = kstrdup(data, GFP_KERNEL);
+	//sb_block = get_sb_block(&data);
+	eext4_warning("ext4_fill_super 3445: sb_block %llu", sb_block);
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		goto out_free_orig;
@@ -3739,6 +3786,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->s_addr_per_block_bits = ilog2(EXT4_ADDR_PER_BLOCK(sb));
 	sbi->s_desc_per_block_bits = ilog2(EXT4_DESC_PER_BLOCK(sb));
 
+	sb_block = le32_to_cpu(es->next_sb_blk);
+
 	for (i = 0; i < 4; i++)
 		sbi->s_hash_seed[i] = le32_to_cpu(es->s_hash_seed[i]);
 	sbi->s_def_hash_version = es->s_def_hash_version;
@@ -3872,7 +3921,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->s_blockfile_groups = min_t(ext4_group_t, sbi->s_groups_count,
 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
-		   EXT4_DESC_PER_BLOCK(sb);
+		   EXT4_DESC_PER_BLOCK(sb);// descriptor block count
 	sbi->s_group_desc = ext4_kvmalloc(db_count *
 					  sizeof(struct buffer_head *),
 					  GFP_KERNEL);
@@ -3882,6 +3931,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		goto failed_mount;
 	}
 
+
+	
 	if (ext4_proc_root)
 		sbi->s_proc = proc_mkdir(sb->s_id, ext4_proc_root);
 
@@ -4850,8 +4901,9 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 	if ((old_opts.s_mount_opt & EXT4_MOUNT_JOURNAL_CHECKSUM) ^
 	    test_opt(sb, JOURNAL_CHECKSUM)) {
 		ext4_msg(sb, KERN_ERR, "changing journal_checksum "
-			 "during remount not supported; ignoring");
-		sbi->s_mount_opt ^= EXT4_MOUNT_JOURNAL_CHECKSUM;
+			 "during remount not supported");
+		err = -EINVAL;
+		goto restore_opts;
 	}
 
 	if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_JOURNAL_DATA) {
@@ -5418,13 +5470,591 @@ out:
 	}
 	return len;
 }
-
 #endif
 
-static struct dentry *ext4_mount(struct file_system_type *fs_type, int flags,
-		       const char *dev_name, void *data)
+static int set_bdev_super(struct super_block *s, void *data)
 {
-	return mount_bdev(fs_type, flags, dev_name, data, ext4_fill_super);
+	s->s_bdev = data;
+	s->s_dev = s->s_bdev->bd_dev;
+
+	/*
+	 * We set the bdi here to the queue backing, file systems can
+	 * overwrite this in ->fill_super()
+	 */
+	s->s_bdi = &bdev_get_queue(s->s_bdev)->backing_dev_info;
+	return 0;
+}
+
+
+
+static int spanfs_fill_super (struct super_block *sb, void *data, int flags) {
+	struct dentry *uvl_root;
+	struct super_block *orig_sb;
+
+	uvl_root = (struct dentry *)data;
+
+	orig_sb = uvl_root->d_inode->i_sb;
+	
+	/*assign the xattr handler*/
+	sb->s_xattr = ext4_xattr_handlers;
+	sb->s_fs_info = EXT4_SB (eext4_devices[0]->sb);
+	
+	uvl_root->d_inode->i_sb = sb;
+	atomic_inc(&uvl_root->d_inode->i_count);
+	sb->s_root = d_make_root (uvl_root->d_inode);
+	uvl_root->d_inode->i_sb = orig_sb;
+	
+	return 0;
+}
+
+struct bdev_inode {
+	struct block_device bdev;
+	struct inode vfs_inode;
+};
+static struct kmem_cache * bdev_cachep __read_mostly;
+
+static struct inode *bdev_alloc_inode(void)
+{
+	struct bdev_inode *ei = kmem_cache_alloc(bdev_cachep, GFP_KERNEL);
+	if (!ei)
+		return NULL;
+	return &ei->vfs_inode;
+}
+static inline struct bdev_inode *BDEV_I(struct inode *inode)
+{
+	return container_of(inode, struct bdev_inode, vfs_inode);
+}
+
+/*
+inline struct block_device *I_BDEV(struct inode *inode)
+{
+	return &BDEV_I(inode)->bdev;
+}
+*/
+
+static void copy_inode_info(struct inode *src, struct inode *dest)
+{
+	dest->i_sb = src->i_sb;
+	dest->i_blkbits = src->i_blkbits;
+	dest->i_size = src->i_size;
+	dest->i_blocks = src->i_blocks;
+	dest->i_bytes = src->i_bytes;
+	dest->i_bdev = src->i_bdev;
+	dest->i_cdev = src->i_cdev;
+	dest->i_rdev = src->i_rdev;
+	dest->i_data.a_ops = src->i_data.a_ops;
+	dest->i_mode = src->i_mode;
+	dest->i_data.backing_dev_info = src->i_data.backing_dev_info;
+
+
+	dest->i_fop = src->i_fop;	
+	dest->i_generation = src->i_generation;
+	dest->i_flags = src->i_flags;
+	
+}
+
+static void copy_bdev_info(struct block_device *src, struct block_device *dest)
+{
+
+	if(src->bd_contains == src)
+		dest->bd_contains = dest;
+	else 
+		dest->bd_contains = src->bd_contains;
+	
+	dest->bd_block_size = src->bd_block_size;
+	dest->bd_dev = src->bd_dev;
+	dest->bd_part = src->bd_part;
+	dest->bd_part_count = src->bd_part_count;
+	
+	dest->bd_disk = src->bd_disk;
+	dest->bd_queue = src->bd_queue;
+	
+	//the fields below may be useless
+	dest->bd_invalidated = src->bd_invalidated;
+	dest->bd_private = src->bd_private;
+
+}
+
+static struct lock_class_key bdev_inode_mutex_class[128];
+static struct lock_class_key bdev_inode_lock_class[128];
+
+static struct lock_class_key bdev_mutex_class;
+static struct lock_class_key bdev_fsfreeze_mutex_class;
+
+
+static void init_bdev_inode(void *foo, int ino)
+{
+	struct bdev_inode *ei = (struct bdev_inode *) foo;
+	struct inode *inode = &ei->vfs_inode;
+	struct block_device *bdev = &ei->bdev;
+	
+
+	memset(bdev, 0, sizeof(*bdev));
+	mutex_init(&bdev->bd_mutex);
+	INIT_LIST_HEAD(&bdev->bd_inodes);
+	INIT_LIST_HEAD(&bdev->bd_list);
+#ifdef CONFIG_SYSFS
+	INIT_LIST_HEAD(&bdev->bd_holder_disks);
+#endif
+	inode_init_once(&ei->vfs_inode);
+	atomic_set(&(ei->vfs_inode.i_count), 2);
+	/* Initialize mutex for freeze. */
+	mutex_init(&bdev->bd_fsfreeze_mutex);
+
+	spin_lock_init(&inode->i_lock);
+	lockdep_set_class(&inode->i_mutex, &bdev_inode_mutex_class[ino]);
+
+	mutex_init(&inode->i_mutex);
+	lockdep_set_class(&inode->i_lock, &bdev_inode_lock_class[ino]);
+	
+	
+
+}
+
+
+struct dentry *spanfs_mount_bdev(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data,
+	int (*fill_super)(struct super_block *, void *, int), struct block_device *bdev,
+	int partition_no)
+{
+	struct block_device *tmp_bdev;
+	struct inode *bd_inode;
+	struct super_block *s;
+	fmode_t mode = FMODE_READ | FMODE_EXCL;
+	int error = 0;
+
+	if (!(flags & MS_RDONLY))
+		mode |= FMODE_WRITE;
+
+//	bdev = blkdev_get_by_path(dev_name, mode, fs_type);
+	
+	//bdev->bd_part->partno = partition_no;
+	
+//	if (IS_ERR(bdev))
+//		return ERR_CAST(bdev);
+
+	
+	bd_inode = bdev_alloc_inode();
+	if(unlikely(!bd_inode)){
+		error = -ENOMEM;
+		goto error;
+	}
+
+	bd_inode->i_sb = bdev->bd_inode->i_sb;
+	init_bdev_inode(BDEV_I(bd_inode), partition_no);
+	bd_inode->i_ino = get_next_ino();
+	copy_inode_info(bdev->bd_inode, bd_inode);
+	bd_inode->i_mapping = &bd_inode->i_data;
+	bd_inode->i_mapping->host = bd_inode;
+
+	
+	mapping_set_gfp_mask(&bd_inode->i_data, GFP_USER);
+	
+	tmp_bdev = I_BDEV(bd_inode);
+	eext4_devices[partition_no]->bd_inode = bd_inode;
+	copy_bdev_info(bdev, tmp_bdev);
+	
+	tmp_bdev->bd_inode = bd_inode;
+	/*
+	 * once the super is inserted into the list by sget, s_umount
+	 * will protect the lockfs code from trying to start a snapshot
+	 * while we are mounting
+	 */
+	mutex_lock(&tmp_bdev->bd_fsfreeze_mutex);
+	if (tmp_bdev->bd_fsfreeze_count > 0) {
+		mutex_unlock(&tmp_bdev->bd_fsfreeze_mutex);
+		error = -EBUSY;
+		goto error_bdev;
+	}
+	s = sget(fs_type, NULL, set_bdev_super, flags | MS_NOSEC,
+		 tmp_bdev);
+	mutex_unlock(&tmp_bdev->bd_fsfreeze_mutex);
+	if (IS_ERR(s))
+		goto error_s;
+
+	if (s->s_root) {
+		if ((flags ^ s->s_flags) & MS_RDONLY) {
+			deactivate_locked_super(s);
+			error = -EBUSY;
+			goto error_bdev;
+		}
+
+		/*
+		 * s_umount nests inside bd_mutex during
+		 * __invalidate_device().  blkdev_put() acquires
+		 * bd_mutex and can't be called under s_umount.  Drop
+		 * s_umount temporarily.  This is safe as we're
+		 * holding an active reference.
+		 */
+		up_write(&s->s_umount);
+	//	blkdev_put(bdev, mode);
+		down_write(&s->s_umount);
+	} else {
+		char b[BDEVNAME_SIZE];
+
+		s->s_mode = mode;
+		strlcpy(s->s_id, bdevname(tmp_bdev, b), sizeof(s->s_id));
+
+		sprintf(s->s_id, "%sp%d", s->s_id, partition_no);
+		
+		sb_set_blocksize(s, block_size(tmp_bdev));
+		error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+		if (error) {
+			deactivate_locked_super(s);
+			goto error;
+		}
+
+		s->s_flags |= MS_ACTIVE;
+		
+		tmp_bdev->bd_super = s;
+	}
+
+	
+	return dget(s->s_root);
+
+error_s:
+	error = PTR_ERR(s);
+error_bdev:
+	//blkdev_put(bdev, mode);
+error:
+	return ERR_PTR(error);
+}
+
+struct super_block *spanfs_get_sb(struct file_system_type *fs_type,
+	int flags)
+{
+
+	struct super_block *s = sget(fs_type, NULL, set_anon_super, flags, NULL);
+
+	if (IS_ERR(s))
+		return ERR_CAST(s);
+	
+	return s;
+}
+
+
+struct dentry *spanfs_mount_nodev(struct super_block *s, int flags, void *data,
+	int (*fill_super)(struct super_block *, void *, int))
+{
+	int error;
+
+	error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+	if (error) {
+		deactivate_locked_super(s);
+		return ERR_PTR(error);
+	}
+	s->s_flags |= MS_ACTIVE;
+	s->s_mode = FMODE_READ | FMODE_EXCL;
+	
+	return dget(s->s_root);
+}
+
+#define MAX_SIZE 4096
+
+struct linux_dirent {
+	unsigned long	d_ino;
+	unsigned long	d_pino;
+	unsigned long	d_device_mask;
+	unsigned long	d_off;
+	unsigned short	d_reclen;
+	unsigned short 	d_namlen;
+	char		d_name[1];
+};
+
+
+extern int getdents(struct file *filp, struct linux_dirent *dirent, unsigned int count);
+
+extern int integrity_validation(struct linux_dirent *dirent, struct inode *spandir_inode);
+
+extern int release_dir_for_gc(struct inode *inode, struct file *filp);
+
+const struct file_operations empty_fops = {
+};
+
+static int can_stop = 0;
+static wait_queue_head_t gc_wait;
+
+static void garbage_collection(void *param)
+{
+	int i, j;
+	struct dentry *spandir;
+	struct inode *spandir_inode;
+	char *buf;
+	int count = MAX_SIZE;
+	int err;
+	struct linux_dirent *dirent;
+	struct gc_file *gc_filp;
+	unsigned long pos, nreads;
+	struct timeval tv_start, tv_end;
+	u64 time;
+	u64 counter = 0;
+	buf = kzalloc(MAX_SIZE, GFP_KERNEL);
+	
+	do_gettimeofday(&tv_start);
+	
+	
+	for(i = 0; i < EEXT4_ONLINE_DEVICE_NUM; i++){
+
+		for(j = 0; j < EEXT4_SPANDIR_NUM; j++){
+			spandir = eext4_devices[i]->SPANDir[j];
+			ASSERT(spandir);
+			spandir_inode = spandir->d_inode;
+			ASSERT(spandir_inode);
+
+			
+			gc_filp = kzalloc(sizeof(struct gc_file ), GFP_KERNEL);
+			if(!gc_filp || IS_ERR(gc_filp)){
+				printk(KERN_ERR "no mem\n");
+				return;
+			}
+			
+			gc_filp->f_inode = spandir_inode;
+			gc_filp->f_mode = FMODE_READ;
+			
+			for(; ;){
+				nreads = getdents(gc_filp, buf, MAX_SIZE);
+				if(nreads < 0){
+					printk(KERN_ERR "spanfs gc error %d\n", nreads);
+					break;
+				}
+
+				if(nreads == 0)
+					break;
+				for(pos = 0; pos < nreads; ){
+					dirent = (struct linux_dirent  *)(buf + pos);
+					if(strcmp(dirent->d_name, ".") && strcmp(dirent->d_name, "..")){
+						integrity_validation(dirent, spandir_inode);
+						
+						counter++;
+					}
+					pos += dirent->d_reclen;
+
+				}
+
+
+			}
+			release_dir_for_gc(spandir_inode, gc_filp);
+			kfree(gc_filp);
+		
+		
+
+
+		}
+		
+
+
+	}
+	
+	
+	
+	do_gettimeofday(&tv_end);
+	time = (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec);
+	kfree(buf);
+	printk(KERN_INFO "GC validated %llu entries and cost %llu us in total\n", counter, time);
+	can_stop = 1;
+	wake_up(&gc_wait);
+
+}
+
+static struct task_struct *t = NULL;
+
+static int spanfs_start_gc_thread(void)
+{
+	
+	can_stop = 0;
+
+	t = kthread_run(garbage_collection, NULL, "gc");
+	if(IS_ERR(t))
+		return PTR_ERR(t);
+
+
+	
+	return 0;
+
+}
+
+
+
+static struct dentry *spanfs_mount(struct file_system_type *fs_type, int flags,
+	const char *dev_name, void *data)
+{
+	int i = 0, j, ret;
+	struct dentry *uvl_root, *spandir, *root;
+	struct file_system_type *ext4_type, *domain_type;
+	char spandir_name[20];
+	struct super_block *spanfs_sb;
+	struct block_device *bdev;
+	fmode_t mode = FMODE_READ | FMODE_EXCL;
+	
+	spanfs_sb = spanfs_get_sb(fs_type, flags);
+	if(IS_ERR(spanfs_sb)){
+		eext4_warning("mount spanfs err %d\n", PTR_ERR(spanfs_sb));
+		ret = ERR_PTR(PTR_ERR(spanfs_sb));
+		goto out;
+	}
+	/* mount format: mount -t spanfs -o data=ordered /dev/ssd /mnt */
+	
+	CPU_CORE_NUM = num_online_cpus();
+	domain_type = get_fs_type("domainfs");
+//	ext4_type = get_fs_type("ext4");
+	bdev_cachep = kmem_cache_create("spanfs_bdev_cache", sizeof(struct bdev_inode),
+			0, (SLAB_HWCACHE_ALIGN|SLAB_RECLAIM_ACCOUNT|
+				SLAB_MEM_SPREAD|SLAB_PANIC),
+			NULL);
+	
+	//mount each device consecutively;
+	bdev = blkdev_get_by_path(dev_name, mode, fs_type);
+	if (IS_ERR(bdev))
+		return ERR_CAST(bdev);
+	
+	
+	do {
+		eext4_devices[i] = eext4_alloc_device();
+		
+		root = spanfs_mount_bdev(domain_type, flags, dev_name, data, ext4_fill_super, bdev, i);
+		
+		if (IS_ERR (root)){
+			eext4_warning("mount ext4 err %d\n", PTR_ERR(root));
+			ret = root;
+			blkdev_put(bdev, mode);
+			goto out;
+		}
+	//	root->d_sb->s_type = domain_type;
+		
+		eext4_devices[i]->device_root = root;
+		eext4_devices[i]->sb = root->d_sb;
+		eext4_devices[i]->SPANDir = kmalloc(EEXT4_SPANDIR_NUM * sizeof(struct dentry *), GFP_KERNEL);
+		//record the identifier of this device in the ext4_sb_info structure of it;
+		EXT4_SB(root->d_sb)->eext4_sb_info_id = i;
+
+		//get the SPANdir for rd and each ed;
+		for(j=0; j < EEXT4_SPANDIR_NUM; j++) {
+			sprintf(spandir_name, "SPANDir-%d\0", j);
+			spandir = eext4_lookup_one_len(root, spandir_name);
+			if (IS_ERR (spandir)){
+				eext4_warning("%s is err %d\n", spandir_name, PTR_ERR(spandir));
+				ret = spandir;
+				blkdev_put(bdev, mode);
+				goto out;
+			}
+			
+			//to fake it as root to facilitate the ext4_add_entry under spandir;
+			spandir->d_parent = spandir;
+			
+			eext4_devices[i]->SPANDir[j] = spandir;
+		}
+
+		//eext4 root device, get the uvl root;
+		if (i == 0) {
+			eext4_rd_uvlroot = eext4_lookup_one_len(root, "EEXT4-ROOT");
+			if (IS_ERR (eext4_rd_uvlroot)) {
+				eext4_warning("look up EEXT4-ROOT err %d\n", PTR_ERR(eext4_rd_uvlroot));
+				ret = eext4_rd_uvlroot;
+				blkdev_put(bdev, mode);
+				goto out;
+			}
+		}
+		up_write (&eext4_devices[i]->sb->s_umount);
+
+		i++;
+	} while (EXT4_SB(root->d_sb)->s_es->next_sb_blk != 0);
+
+	//blkdev_put(bdev, mode);
+	i--;
+	EEXT4_ONLINE_DEVICE_NUM = i + 1;
+
+	//global root inode starts from the root of device 0;
+	uvl_root = spanfs_mount_nodev (spanfs_sb, flags,  eext4_rd_uvlroot, spanfs_fill_super);
+	if (IS_ERR (uvl_root)) {
+		eext4_warning("mount spanfs err %d\n", PTR_ERR(uvl_root));
+		ret = uvl_root;
+		goto out;
+	}
+	spanfs_sb->s_bdev = bdev;
+//	bdev->bd_super = uvl_root->d_sb;
+	set_blocksize(bdev, eext4_rd_uvlroot->d_sb->s_blocksize);
+	printk(KERN_INFO "sb %s %s block size %d\n", spanfs_sb->s_id, uvl_root->d_sb->s_id, eext4_rd_uvlroot->d_sb->s_blocksize);
+	printk(KERN_INFO "spanfsv2 with gc version\n");
+	
+#ifdef GC_ENABLED
+	clear_counter();
+	init_waitqueue_head(&gc_wait);
+	spanfs_start_gc_thread();
+#endif
+	
+	return uvl_root;
+	
+	//down_write (&uvl_root-> d_sb->s_umount);
+out:
+	
+	sb_block = 0;
+	for(j=0; j<=i; j++)
+		eext4_kfree_device(eext4_devices[j]);
+	i = 0;
+	return ret;
+}
+
+
+static void special_kill_block_super(struct super_block *sb)
+{
+	struct block_device *bdev = sb->s_bdev;
+	fmode_t mode = sb->s_mode;
+	
+	bdev->bd_super = NULL;
+	generic_shutdown_super(sb);
+	sync_blockdev(bdev);
+	
+}
+
+
+static struct file_system_type domain_fs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "domainfs",
+	//.mount		= spanfs_mount,
+	.kill_sb	= special_kill_block_super,
+	.fs_flags	= FS_REQUIRES_DEV,
+};
+
+static void eext4_kill_block_super (struct super_block *sb) {
+	int i, j;
+	struct block_device *bdev = sb->s_bdev;
+	fmode_t mode = sb->s_mode;
+
+	//clean up the UVL first;
+#ifdef GC_ENABLED
+	if(can_stop == 0)
+		wait_event(gc_wait, can_stop == 1);
+
+	printk(KERN_INFO "can stop %d %lu\n", can_stop, calculate_total());
+	
+
+#endif
+	
+	kill_anon_super(sb);
+	bdev->bd_super = NULL;
+
+	dput (eext4_rd_uvlroot);
+
+	/*in order to call deactivate_super to deactivate every eext4 super block for real devices,
+	* we need to change the fs->kill_sb pointer here to make sure kill_block_super is called
+	* inside deactivate super. Or else eext4_kill_super will be re-called
+	*/
+	
+	for (i = EEXT4_ONLINE_DEVICE_NUM - 1; i >= 0; i--) {
+		
+		for(j = 0; j < EEXT4_SPANDIR_NUM; j++){
+			eext4_devices[i]->SPANDir[j]->d_parent = eext4_devices[i]->device_root;
+		}
+		dput (eext4_devices[i]->device_root);
+		for(j = 0; j < EEXT4_SPANDIR_NUM; j++){
+			dput (eext4_devices[i]->SPANDir[j]);
+		}
+		
+		deactivate_super (eext4_devices[i]->sb);
+		eext4_kfree_device (eext4_devices[i]);
+	}	
+	WARN_ON_ONCE(!(mode & FMODE_EXCL));
+	blkdev_put(bdev, mode | FMODE_EXCL);
 }
 
 #if !defined(CONFIG_EXT2_FS) && !defined(CONFIG_EXT2_FS_MODULE) && defined(CONFIG_EXT4_USE_FOR_EXT23)
@@ -5489,14 +6119,14 @@ static inline void unregister_as_ext3(void) { }
 static inline int ext3_feature_set_ok(struct super_block *sb) { return 0; }
 #endif
 
-static struct file_system_type ext4_fs_type = {
+static struct file_system_type spanfs_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "ext4",
-	.mount		= ext4_mount,
-	.kill_sb	= kill_block_super,
+	.name		= "spanfsv2",
+	.mount		= spanfs_mount,
+	.kill_sb	= eext4_kill_block_super,
 	.fs_flags	= FS_REQUIRES_DEV,
 };
-MODULE_ALIAS_FS("ext4");
+MODULE_ALIAS_FS("spanfsv2");
 
 static int __init ext4_init_feat_adverts(void)
 {
@@ -5559,12 +6189,12 @@ static int __init ext4_init_fs(void)
 	err = ext4_init_system_zone();
 	if (err)
 		goto out6;
-	ext4_kset = kset_create_and_add("ext4", NULL, fs_kobj);
+	ext4_kset = kset_create_and_add("spanfsv2", NULL, fs_kobj);
 	if (!ext4_kset) {
 		err = -ENOMEM;
 		goto out5;
 	}
-	ext4_proc_root = proc_mkdir("fs/ext4", NULL);
+	ext4_proc_root = proc_mkdir("fs/spanfsv2", NULL);
 
 	err = ext4_init_feat_adverts();
 	if (err)
@@ -5580,7 +6210,8 @@ static int __init ext4_init_fs(void)
 		goto out1;
 	register_as_ext3();
 	register_as_ext2();
-	err = register_filesystem(&ext4_fs_type);
+	err = register_filesystem(&spanfs_fs_type);
+	err |= register_filesystem(&domain_fs_type);
 	if (err)
 		goto out;
 
@@ -5596,7 +6227,7 @@ out2:
 	ext4_exit_feat_adverts();
 out4:
 	if (ext4_proc_root)
-		remove_proc_entry("fs/ext4", NULL);
+		remove_proc_entry("fs/spanfsv2", NULL);
 	kset_unregister(ext4_kset);
 out5:
 	ext4_exit_system_zone();
@@ -5613,11 +6244,12 @@ static void __exit ext4_exit_fs(void)
 	ext4_destroy_lazyinit_thread();
 	unregister_as_ext2();
 	unregister_as_ext3();
-	unregister_filesystem(&ext4_fs_type);
+	unregister_filesystem(&spanfs_fs_type);
+	unregister_filesystem(&domain_fs_type);
 	destroy_inodecache();
 	ext4_exit_mballoc();
 	ext4_exit_feat_adverts();
-	remove_proc_entry("fs/ext4", NULL);
+	remove_proc_entry("fs/spanfsv2", NULL);
 	kset_unregister(ext4_kset);
 	ext4_exit_system_zone();
 	ext4_exit_pageio();

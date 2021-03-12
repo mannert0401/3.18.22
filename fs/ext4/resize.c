@@ -555,7 +555,7 @@ handle_itb:
 
 		/* Zero out all of the inode table blocks */
 		block = group_data[i].inode_table;
-		ext4_debug("clear inode table blocks %#04llx -> %#04lx\n",
+		ext4_debug("clear inode table blocks %#04llx->%#04lx\n",
 			   block, sbi->s_itb_per_group);
 		err = sb_issue_zeroout(sb, block, sbi->s_itb_per_group,
 				       GFP_NOFS);

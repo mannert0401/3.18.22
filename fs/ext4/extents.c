@@ -377,7 +377,7 @@ static int ext4_valid_extent(struct inode *inode, struct ext4_extent *ext)
 	ext4_lblk_t lblock = le32_to_cpu(ext->ee_block);
 	ext4_lblk_t last = lblock + len - 1;
 
-	if (len == 0 || lblock > last)
+	if (lblock > last)
 		return 0;
 	return ext4_data_block_valid(EXT4_SB(inode->i_sb), block, len);
 }
@@ -748,7 +748,7 @@ ext4_ext_binsearch_idx(struct inode *inode,
 	}
 
 	path->p_idx = l - 1;
-	ext_debug("  -> %u->%lld ", le32_to_cpu(path->p_idx->ei_block),
+	ext_debug(" ->%u->%lld ", le32_to_cpu(path->p_idx->ei_block),
 		  ext4_idx_pblock(path->p_idx));
 
 #ifdef CHECK_BINSEARCH
@@ -816,7 +816,7 @@ ext4_ext_binsearch(struct inode *inode,
 	}
 
 	path->p_ext = l - 1;
-	ext_debug("  -> %d:%llu:[%d]%d ",
+	ext_debug(" ->%d:%llu:[%d]%d ",
 			le32_to_cpu(path->p_ext->ee_block),
 			ext4_ext_pblock(path->p_ext),
 			ext4_ext_is_unwritten(path->p_ext),
@@ -1181,7 +1181,7 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
 		fidx->ei_block = border;
 		ext4_idx_store_pblock(fidx, oldblock);
 
-		ext_debug("int.index at %d (block %llu): %u -> %llu\n",
+		ext_debug("int.index at %d (block %llu): %u->%llu\n",
 				i, newblock, le32_to_cpu(border), oldblock);
 
 		/* move remainder of path[i] to the new index block */
@@ -1393,7 +1393,7 @@ repeat:
 		}
 
 		/*
-		 * only first (depth 0 -> 1) produces free space;
+		 * only first (depth 0->1) produces free space;
 		 * in all other cases we have to split the grown tree
 		 */
 		depth = ext_depth(inode);
@@ -2347,7 +2347,7 @@ ext4_ext_put_gap_in_cache(struct inode *inode, struct ext4_ext_path *path,
 		BUG();
 	}
 
-	ext_debug(" -> %u:%lu\n", lblock, len);
+	ext_debug("->%u:%lu\n", lblock, len);
 }
 
 /*
@@ -3626,7 +3626,7 @@ out:
  *   b> Splits in two extents: Write is happening at either end of the extent
  *   c> Splits in three extents: Somone is writing in middle of the extent
  *
- * This works the same way in the case of initialized -> unwritten conversion.
+ * This works the same way in the case of initialized->unwritten conversion.
  *
  * One of more index blocks maybe needed if the extent tree grow after
  * the unwritten extent split. To prevent ENOSPC occur at the IO
@@ -4316,7 +4316,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 			newblock = map->m_lblk - ee_block + ee_start;
 			/* number of remaining blocks in the extent */
 			allocated = ee_len - (map->m_lblk - ee_block);
-			ext_debug("%u fit into %u:%d -> %llu\n", map->m_lblk,
+			ext_debug("%u fit into %u:%d->%llu\n", map->m_lblk,
 				  ee_block, ee_len, newblock);
 
 			/*
@@ -4923,6 +4923,13 @@ long ext4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	if (ret)
 		return ret;
 
+	/*
+	 * currently supporting (pre)allocate mode for extent-based
+	 * files _only_
+	 */
+	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)))
+		return -EOPNOTSUPP;
+
 	if (mode & FALLOC_FL_COLLAPSE_RANGE)
 		return ext4_collapse_range(inode, offset, len);
 
@@ -4943,14 +4950,6 @@ long ext4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		flags |= EXT4_GET_BLOCKS_KEEP_SIZE;
 
 	mutex_lock(&inode->i_mutex);
-
-	/*
-	 * We only support preallocation for extent-based files only
-	 */
-	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
 
 	if (!(mode & FALLOC_FL_KEEP_SIZE) &&
 	     offset + len > i_size_read(inode)) {
