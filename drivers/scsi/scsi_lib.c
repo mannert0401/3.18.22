@@ -1759,6 +1759,10 @@ static void scsi_request_fn(struct request_queue *q)
 			goto out_delay;
 		}
 		spin_lock_irq(q->queue_lock);
+
+		/* [NHJ] UFS */
+		//if(req->cmd_bflags & REQ_ORDERED)
+		blk_request_dispatched(req);
 	}
 
 	return;

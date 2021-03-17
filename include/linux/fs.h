@@ -199,7 +199,9 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define WRITE_FLUSH		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FLUSH)
 #define WRITE_FUA		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FUA)
 #define WRITE_FLUSH_FUA		(WRITE | REQ_SYNC | REQ_NOIDLE | REQ_FLUSH | REQ_FUA)
-
+// [NHJ] UFS project
+#define        WRITE_ORDERED           (WRITE | REQ_SYNC | REQ_NOIDLE | REQ_ORDERED)
+#define        WRITE_BARRIER           (WRITE | REQ_SYNC | REQ_NOIDLE | REQ_ORDERED | REQ_BARRIER)
 /*
  * Attribute flags.  These should be or-ed together to figure out what
  * has been changed!
@@ -1501,6 +1503,8 @@ struct file_operations {
 	int (*flush) (struct file *, fl_owner_t id);
 	int (*release) (struct inode *, struct file *);
 	int (*fsync) (struct file *, loff_t, loff_t, int datasync);
+        // [NHJ] UFS project add
+        int (*fbarrier) (struct file *, loff_t, loff_t, int datasync);
 	int (*aio_fsync) (struct kiocb *, int datasync);
 	int (*fasync) (int, struct file *, int);
 	int (*lock) (struct file *, int, struct file_lock *);
@@ -2120,6 +2124,8 @@ extern struct super_block *freeze_bdev(struct block_device *);
 extern void emergency_thaw_all(void);
 extern int thaw_bdev(struct block_device *bdev, struct super_block *sb);
 extern int fsync_bdev(struct block_device *);
+// [NHJ] UFS project add
+extern int fbarrier_bdev(struct block_device *);
 extern int sb_is_blkdev_sb(struct super_block *sb);
 #else
 static inline void bd_forget(struct inode *inode) {}
@@ -2265,9 +2271,29 @@ extern int __filemap_fdatawrite_range(struct address_space *mapping,
 extern int filemap_fdatawrite_range(struct address_space *mapping,
 				loff_t start, loff_t end);
 
+/* [NHJ] UFS */
+extern int filemap_fdatadispatch(struct address_space *);
+
+extern int filemap_fdatadispatch_range(struct address_space *, loff_t lstart, 
+                       loff_t lend);
+
+extern int filemap_write_and_dispatch_range(struct address_space *,
+                       loff_t lstart, loff_t lend);
+extern int filemap_ordered_write_range(struct address_space *,
+                       loff_t lstart, loff_t lend);
+
+
 extern int vfs_fsync_range(struct file *file, loff_t start, loff_t end,
 			   int datasync);
 extern int vfs_fsync(struct file *file, int datasync);
+
+
+// [NHJ] UFS project add
+extern int vfs_fbarrier_range(struct file *file, loff_t start, loff_t end,
+                           int datasync);
+// [NHJ] UFS project add
+extern int vfs_fbarrier(struct file *file, int datasync);
+
 static inline int generic_write_sync(struct file *file, loff_t pos, loff_t count)
 {
 	if (!(file->f_flags & O_DSYNC) && !IS_SYNC(file->f_mapping->host))
@@ -2275,6 +2301,10 @@ static inline int generic_write_sync(struct file *file, loff_t pos, loff_t count
 	return vfs_fsync_range(file, pos, pos + count - 1,
 			       (file->f_flags & __O_SYNC) ? 0 : 1);
 }
+
+// [NHJ] UFS project add
+extern int generic_write_fbarrier(struct file *file, loff_t pos, loff_t count);
+
 extern void emergency_sync(void);
 extern void emergency_remount(void);
 #ifdef CONFIG_BLOCK
@@ -2446,7 +2476,9 @@ static inline void remove_inode_hash(struct inode *inode)
 extern void inode_sb_list_add(struct inode *inode);
 
 #ifdef CONFIG_BLOCK
-extern void submit_bio(int, struct bio *);
+extern void submit_bio(long long /*int*/, struct bio *);
+/* [NHJ] UFS */
+extern void submit_bio64(long long, struct bio *);
 extern int bdev_read_only(struct block_device *);
 #endif
 extern int set_blocksize(struct block_device *, int);
@@ -2473,6 +2505,9 @@ extern ssize_t blkdev_read_iter(struct kiocb *iocb, struct iov_iter *to);
 extern ssize_t blkdev_write_iter(struct kiocb *iocb, struct iov_iter *from);
 extern int blkdev_fsync(struct file *filp, loff_t start, loff_t end,
 			int datasync);
+// [NHJ] UFS project add
+extern int blkdev_fbarrier(struct file *filp, loff_t start, loff_t end,
+                       int datasync);
 extern void block_sync_page(struct page *page);
 
 /* fs/splice.c */

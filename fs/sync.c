@@ -183,6 +183,17 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 }
 EXPORT_SYMBOL(vfs_fsync_range);
 
+/* UFS project add by */
+int vfs_fbarrier_range(struct file *file, loff_t start, loff_t end, int datasync)
+{
+ //  printk("in vfs_fbarrier_range FN\n");
+        if (!file->f_op || !file->f_op->fbarrier)
+                return -EINVAL;
+        return file->f_op->fbarrier(file, start, end, datasync);
+}
+EXPORT_SYMBOL(vfs_fbarrier_range);
+
+
 /**
  * vfs_fsync - perform a fsync or fdatasync on a file
  * @file:		file to sync
@@ -197,6 +208,14 @@ int vfs_fsync(struct file *file, int datasync)
 }
 EXPORT_SYMBOL(vfs_fsync);
 
+//[NHJ] UFS project add by 
+int vfs_fbarrier(struct file *file, int datasync)
+{
+ //  printk("in vfs_fbarrier FN\n");
+        return vfs_fbarrier_range(file, 0, LLONG_MAX, datasync);
+}
+EXPORT_SYMBOL(vfs_fbarrier);
+
 static int do_fsync(unsigned int fd, int datasync)
 {
 	struct fd f = fdget(fd);
@@ -209,6 +228,21 @@ static int do_fsync(unsigned int fd, int datasync)
 	return ret;
 }
 
+//UFS project add
+static int do_fbarrier(unsigned int fd, int datasync)
+{
+        struct fd f =fdget(fd);
+        int ret = -EBADF;
+ 
+//     printk("in do_fbarrier FN\n");
+ 
+        if (f.file) {
+                ret = vfs_fbarrier(f.file, datasync);
+                fdput(f);
+        }
+        return ret;
+}
+
 SYSCALL_DEFINE1(fsync, unsigned int, fd)
 {
 	return do_fsync(fd, 0);
@@ -218,6 +252,30 @@ SYSCALL_DEFINE1(fdatasync, unsigned int, fd)
 {
 	return do_fsync(fd, 1);
 }
+
+// UFS project add
+SYSCALL_DEFINE1(fbarrier, unsigned int, fd)
+{
+//      printk("in SYSCALL_DEFINE1(fbarrier)\n");
+        return do_fbarrier(fd, 0);
+}
+
+SYSCALL_DEFINE1(fdatabarrier, unsigned int, fd)
+{
+        return do_fbarrier(fd, 1);
+}
+
+//UFS project
+int generic_write_fbarrier(struct file *file, loff_t pos, loff_t count)
+{
+//  printk("in generic_write_fbarrier FN\n");
+        if (!(file->f_flags & O_DSYNC) && !IS_SYNC(file->f_mapping->host))
+                return 0;
+        return vfs_fbarrier_range(file, pos, pos + count - 1,
+                               (file->f_flags & __O_SYNC) ? 0 : 1);
+}
+EXPORT_SYMBOL(generic_write_fbarrier);
+
 
 /*
  * sys_sync_file_range() permits finely controlled syncing over a segment of

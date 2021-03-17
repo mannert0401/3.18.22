@@ -383,6 +383,12 @@ asmlinkage long sys_pause(void);
 asmlinkage long sys_sync(void);
 asmlinkage long sys_fsync(unsigned int fd);
 asmlinkage long sys_fdatasync(unsigned int fd);
+
+/* [NHJ] UFS */
+asmlinkage long sys_fbarrier(unsigned int fd);
+asmlinkage long sys_fdatabarrier(unsigned int fd);
+
+
 asmlinkage long sys_bdflush(int func, long data);
 asmlinkage long sys_mount(char __user *dev_name, char __user *dir_name,
 				char __user *type, unsigned long flags,
@@ -872,6 +878,10 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
 asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
 			 unsigned long idx1, unsigned long idx2);
 asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+
+//asmlinkage long sys_mycall(void);
+asmlinkage long sys_mycall(unsigned int psp_mode);
+
 asmlinkage long sys_seccomp(unsigned int op, unsigned int flags,
 			    const char __user *uargs);
 asmlinkage long sys_getrandom(char __user *buf, size_t count,

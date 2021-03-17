@@ -61,11 +61,27 @@ inline void touch_buffer(struct buffer_head *bh)
 }
 EXPORT_SYMBOL(touch_buffer);
 
+
+int sleep_on_buffer(struct wait_bit_key *key,int mode)
+{
+        io_schedule();
+        return 0;
+}
+
 void __lock_buffer(struct buffer_head *bh)
 {
 	wait_on_bit_lock_io(&bh->b_state, BH_Lock, TASK_UNINTERRUPTIBLE);
 }
 EXPORT_SYMBOL(__lock_buffer);
+
+/* [NHJ] UFS */
+void __lock_buffer_dispatch(struct buffer_head *bh)
+{
+       //wait_on_bit_lock(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+       wait_on_bit_lock_action(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+}
+EXPORT_SYMBOL(__lock_buffer_dispatch);
+
 
 void unlock_buffer(struct buffer_head *bh)
 {
@@ -178,6 +194,9 @@ void end_buffer_write_sync(struct buffer_head *bh, int uptodate)
 		set_buffer_write_io_error(bh);
 		clear_buffer_uptodate(bh);
 	}
+
+	/* [NHJ] UFS */
+	wake_up_buffer_dispatch(bh);
 	unlock_buffer(bh);
 	put_bh(bh);
 }
@@ -616,6 +635,14 @@ void mark_buffer_dirty_inode(struct buffer_head *bh, struct inode *inode)
 	}
 }
 EXPORT_SYMBOL(mark_buffer_dirty_inode);
+
+void mark_buffer_dirty_inode_sync(struct buffer_head *bh, struct inode *inode)
+{
+       set_buffer_sync_flush(bh);
+       mark_buffer_dirty_inode(bh, inode);
+}
+EXPORT_SYMBOL(mark_buffer_dirty_inode_sync);
+
 
 /*
  * Mark the page dirty, and set it dirty in the radix tree, and mark the inode
@@ -1166,6 +1193,36 @@ void mark_buffer_dirty(struct buffer_head *bh)
 	}
 }
 EXPORT_SYMBOL(mark_buffer_dirty);
+
+void mark_buffer_dirty_sync(struct buffer_head *bh)
+{
+       WARN_ON_ONCE(!buffer_uptodate(bh));
+
+       /*
+        * Very *carefully* optimize the it-is-already-dirty case.
+        *
+        * Don't let the final "is it dirty" escape to before we
+        * perhaps modified the buffer.
+        */
+       if (buffer_dirty(bh)) {
+               smp_mb();
+               if (buffer_dirty(bh))
+                       return;
+       }
+
+       set_buffer_sync_flush(bh);
+       if (!test_set_buffer_dirty(bh)) {
+               struct page *page = bh->b_page;
+               if (!TestSetPageDirty(page)) {
+                       struct address_space *mapping = page_mapping(page);
+                       if (mapping)
+                               __set_page_dirty(page, mapping, 0);
+               }
+       }
+}
+EXPORT_SYMBOL(mark_buffer_dirty_sync);
+
+
 
 /*
  * Decrement a buffer_head's reference count.  If all buffers against a page
@@ -3040,6 +3097,11 @@ int _submit_bh(int rw, struct buffer_head *bh, unsigned long bio_flags)
 		rw |= REQ_META;
 	if (buffer_prio(bh))
 		rw |= REQ_PRIO;
+	
+	if(buffer_sync_flush(bh)) {
+		rw |= REQ_SYNC;
+		clear_buffer_sync_flush(bh);
+	}
 
 	bio_get(bio);
 	submit_bio(rw, bio);
@@ -3057,6 +3119,83 @@ int submit_bh(int rw, struct buffer_head *bh)
 	return _submit_bh(rw, bh, 0);
 }
 EXPORT_SYMBOL(submit_bh);
+
+/* [NHJ] UFS */
+int dispatch_bio_bh(struct bio *bio)
+{
+  if (bio->bi_end_io == end_bio_bh_io_sync && bio->bi_private) {
+    wake_up_buffer_dispatch(bio->bi_private);
+    return 1;
+  }
+  return 0;
+}
+EXPORT_SYMBOL(dispatch_bio_bh);
+
+int _submit_bh64(long long rw, struct buffer_head *bh, unsigned long long bio_flags)
+{
+       struct bio *bio;
+       int ret = 0;
+
+       BUG_ON(!buffer_locked(bh));
+       BUG_ON(!buffer_mapped(bh));
+       BUG_ON(!bh->b_end_io);
+       BUG_ON(buffer_delay(bh));
+       BUG_ON(buffer_unwritten(bh));
+
+       /*
+        * Only clear out a write error when rewriting
+        */
+       if (test_set_buffer_req(bh) && (rw & WRITE))
+               clear_buffer_write_io_error(bh);
+
+       /*
+        * from here on down, it's all bio -- do the initial mapping,
+        * submit_bio -> generic_make_request may further map this bio around
+        */
+       bio = bio_alloc(GFP_NOIO, 1);
+
+       bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+       bio->bi_bdev = bh->b_bdev;
+       bio->bi_io_vec[0].bv_page = bh->b_page;
+       bio->bi_io_vec[0].bv_len = bh->b_size;
+       bio->bi_io_vec[0].bv_offset = bh_offset(bh);
+
+       bio->bi_vcnt = 1;
+       bio->bi_iter.bi_size = bh->b_size;
+
+       bio->bi_end_io = end_bio_bh_io_sync;
+       bio->bi_private = bh;
+
+       /* Take care of bh's that straddle the end of the device */
+       guard_bio_eod(rw, bio);
+
+       if (buffer_meta(bh))
+               rw |= REQ_META;
+       if (buffer_prio(bh))
+               rw |= REQ_PRIO;
+
+       if(buffer_sync_flush(bh)) {
+               rw |= REQ_SYNC;
+               clear_buffer_sync_flush(bh);
+       }
+
+       bio_get(bio);
+       /* UFS */
+       //set_buffer_dispatch(bh);
+       lock_buffer_dispatch(bh);
+       submit_bio64(rw, bio);
+       if (bio_flagged(bio, BIO_EOPNOTSUPP))
+               ret = -EOPNOTSUPP;
+       bio_put(bio);
+       return ret;
+}
+EXPORT_SYMBOL(_submit_bh64);
+
+int submit_bh64(long long rw, struct buffer_head *bh)
+{
+       return _submit_bh64(rw, bh, 0);
+}
+EXPORT_SYMBOL(submit_bh64);
 
 /**
  * ll_rw_block: low-level access to block devices (DEPRECATED)
@@ -3409,6 +3548,14 @@ int bh_submit_read(struct buffer_head *bh)
 	return -EIO;
 }
 EXPORT_SYMBOL(bh_submit_read);
+
+/* [NHJ] UFS */
+void __wait_on_buffer_dispatch(struct buffer_head *bh)
+{
+       //wait_on_bit(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+       wait_on_bit_action(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+}
+EXPORT_SYMBOL(__wait_on_buffer_dispatch);
 
 void __init buffer_init(void)
 {

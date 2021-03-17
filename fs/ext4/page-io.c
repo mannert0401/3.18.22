@@ -354,6 +354,23 @@ void ext4_io_submit_init(struct ext4_io_submit *io,
 			 struct writeback_control *wbc)
 {
 	io->io_op = (wbc->sync_mode == WB_SYNC_ALL ?  WRITE_SYNC : WRITE);
+
+	/* [NHJ] UFS */
+        switch (wbc->sync_mode) {
+        case WB_SYNC_ALL:
+                io->io_op = WRITE_SYNC;
+                break;
+        case WB_SYNC_NONE:
+                io->io_op = WRITE;
+                break;
+        case WB_ORDERED_ALL:
+                io->io_op = WRITE_ORDERED;
+                break;
+        case WB_BARRIER_ALL:
+                io->io_op = WRITE_ORDERED;
+                break;
+        }
+
 	io->io_bio = NULL;
 	io->io_end = NULL;
 }

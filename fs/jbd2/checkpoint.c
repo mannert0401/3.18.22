@@ -143,6 +143,14 @@ void __jbd2_log_wait_for_space(journal_t *journal)
 
 			if (journal->j_committing_transaction)
 				tid = journal->j_committing_transaction->t_tid;
+			/* [NHJ] UFS */
+                        else {
+                                spin_lock(&journal->j_cplist_lock);
+                                if (journal->j_cpsetup_transactions)
+                                        tid = journal->j_cpsetup_transactions->t_tid;
+                                spin_unlock(&journal->j_cplist_lock);
+                        }
+
 			spin_unlock(&journal->j_list_lock);
 			write_unlock(&journal->j_state_lock);
 			if (chkpt) {
@@ -157,7 +165,8 @@ void __jbd2_log_wait_for_space(journal_t *journal)
 				 * is set.  So we need to temporarily drop it.
 				 */
 				mutex_unlock(&journal->j_checkpoint_mutex);
-				jbd2_log_wait_commit(journal, tid);
+				/* [NHJ] UFS */
+				jbd2_log_wait_cpsetup(journal, tid);
 				write_lock(&journal->j_state_lock);
 				continue;
 			} else {

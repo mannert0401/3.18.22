@@ -105,6 +105,13 @@ jbd2_get_transaction(journal_t *journal, transaction_t *transaction)
 	transaction->t_start = jiffies;
 	transaction->t_requested = 0;
 
+        /* [NHJ] UFS */
+        INIT_LIST_HEAD(&transaction->io_bufs);
+        INIT_LIST_HEAD(&transaction->log_bufs);
+        atomic_set(&transaction->t_conflict_count, 0);
+        INIT_LIST_HEAD(&transaction->t_jh_wait_list);
+ 
+        transaction->cbh = NULL;
 	return transaction;
 }
 
@@ -761,6 +768,15 @@ static void warn_dirty_buffer(struct buffer_head *bh)
 	       bdevname(bh->b_bdev, b), (unsigned long long)bh->b_blocknr);
 }
 
+int sleep_on_shadow_bh(/*void *word*/ struct wait_bit_key *key)
+{
+        io_schedule();
+        return 0;
+}
+EXPORT_SYMBOL_GPL(sleep_on_shadow_bh);
+ 
+#define CPSETUPWAIT
+
 /*
  * If the buffer is already part of the current transaction, then there
  * is nothing we need to do.  If it is already part of a prior
@@ -771,6 +787,7 @@ static void warn_dirty_buffer(struct buffer_head *bh)
  * part of the transaction, that is).
  *
  */
+extern unsigned int jbd2_psp_mode;
 static int
 do_get_write_access(handle_t *handle, struct journal_head *jh,
 			int force_copy)
@@ -782,7 +799,11 @@ do_get_write_access(handle_t *handle, struct journal_head *jh,
 	char *frozen_buffer = NULL;
 	int need_copy = 0;
 	unsigned long start_lock, time_lock;
-
+#ifdef PAGE_CONFLICT_PROFILE
+        sector_t b_blocknr;
+#endif
+	tid_t wait_tid;
+	
 	if (is_handle_aborted(handle))
 		return -EROFS;
 	journal = transaction->t_journal;
@@ -824,14 +845,15 @@ repeat:
 		 * transaction or the existing committing transaction?
 		 */
 		if (jh->b_transaction) {
-			J_ASSERT_JH(jh,
-				jh->b_transaction == transaction ||
-				jh->b_transaction ==
-					journal->j_committing_transaction);
-			if (jh->b_next_transaction)
-				J_ASSERT_JH(jh, jh->b_next_transaction ==
-							transaction);
-			warn_dirty_buffer(bh);
+                       /* UFS */
+                       if (jh->b_next_transaction) {
+                               if (jh->b_next_transaction != transaction) {
+                                       unlock_buffer(bh);
+                                       goto wait;
+                               }
+                               J_ASSERT_JH(jh, jh->b_next_transaction == transaction);
+                       }
+		       warn_dirty_buffer(bh);
 		}
 		/*
 		 * In any case we need to clean the dirty flag and we must
@@ -872,8 +894,12 @@ repeat:
 	 */
 	if (jh->b_frozen_data) {
 		JBUFFER_TRACE(jh, "has frozen data");
-		J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
-		jh->b_next_transaction = transaction;
+                /* [NHJ] UFS */
+                if (jh->b_next_transaction != NULL) {
+                        goto wait;
+                }
+ 		jh->b_next_transaction = transaction;
+                atomic_inc(&jh->b_next_transaction->t_conflict_count);
 		goto done;
 	}
 
@@ -881,9 +907,13 @@ repeat:
 
 	if (jh->b_transaction && jh->b_transaction != transaction) {
 		JBUFFER_TRACE(jh, "owned by older transaction");
+                /* [NHJ] UFS */
+                if (jh->b_next_transaction != NULL) {
+			wait_tid = jh->b_next_transaction->t_tid;
+                        goto wait;
+                }
+
 		J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
-		J_ASSERT_JH(jh, jh->b_transaction ==
-					journal->j_committing_transaction);
 
 		/* There is one case we have to be very careful about.
 		 * If the committing transaction is currently writing
@@ -897,8 +927,20 @@ repeat:
 		if (buffer_shadow(bh)) {
 			JBUFFER_TRACE(jh, "on shadow: sleep");
 			jbd_unlock_bh_state(bh);
-			wait_on_bit_io(&bh->b_state, BH_Shadow,
-				       TASK_UNINTERRUPTIBLE);
+#ifdef PAGE_CONFLICT_PROFILE
+                        b_blocknr = bh->b_blocknr;
+                        if (journal->pcl == NULL) {
+	                        struct conf_node *tmp = kzalloc(sizeof(struct conf_node), GFP_KERNEL);
+	                        tmp->b_blocknr = b_blocknr;
+	                        tmp->wait = 1;
+	                        tmp->next = NULL;
+                                journal->pcl = tmp;
+                        } else {
+	                        insert_conflict_pn(journal->pcl, b_blocknr, 1);
+			}
+#endif
+			wait_on_bit_action(&bh->b_state, BH_Shadow,
+				sleep_on_shadow_bh, TASK_UNINTERRUPTIBLE);
 			goto repeat;
 		}
 
@@ -940,6 +982,7 @@ repeat:
 			need_copy = 1;
 		}
 		jh->b_next_transaction = transaction;
+		atomic_inc(&jh->b_next_transaction->t_conflict_count);
 	}
 
 
@@ -980,6 +1023,43 @@ done:
 		 */
 		jh->b_frozen_triggers = jh->b_triggers;
 	}
+
+#if (defined(JBD2_BARRIER_CONFLICT_COUNT) && defined(DELAY_ON_COMMIT_WITH_LOOP)) 
+         if (!(jbd2_psp_mode & JBD2_BARRIER_CONFLICT_COUNT) &&
+                         jh->b_transaction && jh->b_transaction != transaction) {
+                 spin_lock(&journal->j_list_lock);
+                 if (list_empty(&jh->b_jh_wait_list)){
+                         list_add_tail(&jh->b_jh_wait_list, &transaction->t_jh_wait_list);
+                         spin_unlock(&journal->j_list_lock);
+                 } else if (jh->b_next_transaction != transaction) {
+                         wake_up(&journal->j_wait_cpsetup);
+                         spin_unlock(&journal->j_list_lock);
+                        unlock_buffer(bh);
+                         jbd_unlock_bh_state(bh);
+                         wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction || !jh->b_transaction);
+                        goto repeat;
+                 }
+                 else
+                         spin_unlock(&journal->j_list_lock);
+         }
+#elif (!defined(JBD2_BARRIER_CONFLICT_COUNT))
+         if (jh->b_transaction && jh->b_transaction != transaction) {
+                 spin_lock(&journal->j_list_lock);
+                 if (list_empty(&jh->b_jh_wait_list)){
+                         list_add_tail(&jh->b_jh_wait_list, &transaction->t_jh_wait_list);
+                         spin_unlock(&journal->j_list_lock);
+                 } else if (jh->b_next_transaction != transaction) {
+                         wake_up(&journal->j_wait_cpsetup);
+                         spin_unlock(&journal->j_list_lock);
+                         unlock_buffer(bh);
+                         jbd_unlock_bh_state(bh);
+                         wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction || !jh->b_transaction);
+                         goto repeat;
+                 }
+                 else
+                         spin_unlock(&journal->j_list_lock);
+         }
+#endif
 	jbd_unlock_bh_state(bh);
 
 	/*
@@ -994,6 +1074,30 @@ out:
 
 	JBUFFER_TRACE(jh, "exit");
 	return error;
+
+wait:  
+        {
+                tid_t tid;
+ 
+                jbd_unlock_bh_state(bh);
+                read_lock(&journal->j_state_lock);
+ 
+                if (jh->b_transaction)
+                        tid = jh->b_transaction->t_tid;
+                else if (jh->b_next_transaction)
+                        tid = jh->b_next_transaction->t_tid;
+                else
+                        tid = journal->j_commit_sequence;
+ 
+                if (tid_gt(tid, journal->j_cpsetup_sequence)) {
+                        wake_up(&journal->j_wait_cpsetup);
+                        read_unlock(&journal->j_state_lock);    
+                        wait_event(journal->j_wait_done_cpsetup, !tid_gt(tid, journal->j_cpsetup_sequence));      
+                }
+                read_unlock(&journal->j_state_lock);
+        }
+        goto repeat;
+
 }
 
 /**
@@ -1043,16 +1147,21 @@ int jbd2_journal_get_write_access(handle_t *handle, struct buffer_head *bh)
 int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 {
 	transaction_t *transaction = handle->h_transaction;
-	journal_t *journal;
+	journal_t *journal = transaction->t_journal;
 	struct journal_head *jh = jbd2_journal_add_journal_head(bh);
 	int err;
 
 	jbd_debug(5, "journal_head %p\n", jh);
 	err = -EROFS;
+
+#ifdef CPSETUPWAIT
+repeat:
+#endif
 	if (is_handle_aborted(handle))
 		goto out;
-	journal = transaction->t_journal;
+	//journal = transaction->t_journal;
 	err = 0;
+
 
 	JBUFFER_TRACE(jh, "entry");
 	/*
@@ -1063,11 +1172,26 @@ int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 	 * reused here.
 	 */
 	jbd_lock_bh_state(bh);
-	J_ASSERT_JH(jh, (jh->b_transaction == transaction ||
-		jh->b_transaction == NULL ||
-		(jh->b_transaction == journal->j_committing_transaction &&
-			  jh->b_jlist == BJ_Forget)));
 
+#ifndef        CPSETUPWAIT
+        spin_lock(&journal->j_list_lock);
+#else
+        /* UFS */
+        read_lock(&journal->j_state_lock);
+        spin_lock(&journal->j_list_lock);
+        if ((jh->b_transaction && jh->b_transaction != transaction && jh->b_jlist != BJ_Forget) || jh->b_next_transaction) {
+                tid_t tid = 0;
+                tid = jh->b_next_transaction ? jh->b_next_transaction->t_tid : jh->b_transaction->t_tid;
+                /* UFS: wait shadow to forget */
+                wake_up(&journal->j_wait_cpsetup);
+                jbd_unlock_bh_state(bh);
+                spin_unlock(&journal->j_list_lock);
+                read_unlock(&journal->j_state_lock);
+                wait_event(journal->j_wait_done_cpsetup, !jh->b_next_transaction);
+                goto repeat;
+        }
+        read_unlock(&journal->j_state_lock);
+#endif
 	J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
 	J_ASSERT_JH(jh, buffer_locked(jh2bh(jh)));
 
@@ -1085,15 +1209,19 @@ int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 		jh->b_modified = 0;
 
 		JBUFFER_TRACE(jh, "file as BJ_Reserved");
-		spin_lock(&journal->j_list_lock);
+		//spin_lock(&journal->j_list_lock);
 		__jbd2_journal_file_buffer(jh, transaction, BJ_Reserved);
-	} else if (jh->b_transaction == journal->j_committing_transaction) {
+		//spin_unlock( &journal->j_list_lock);
+	//} else if (jh->b_transaction == journal->j_committing_transaction) {
+	} else if (jh->b_transaction == journal->j_committing_transaction || jh->b_transaction != transaction) { /* [NHJ] UFS*/
 		/* first access by this transaction */
 		jh->b_modified = 0;
 
 		JBUFFER_TRACE(jh, "set next transaction");
-		spin_lock(&journal->j_list_lock);
+		//spin_lock(&journal->j_list_lock);
 		jh->b_next_transaction = transaction;
+		atomic_inc(&jh->b_next_transaction->t_conflict_count);
+		//spin_unlock(&journal->j_list_lock);
 	}
 	spin_unlock(&journal->j_list_lock);
 	jbd_unlock_bh_state(bh);
@@ -1325,25 +1453,17 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
 	 */
 	if (jh->b_transaction != transaction) {
 		JBUFFER_TRACE(jh, "already on other transaction");
-		if (unlikely(((jh->b_transaction !=
-			       journal->j_committing_transaction)) ||
-			     (jh->b_next_transaction != transaction))) {
-			printk(KERN_ERR "jbd2_journal_dirty_metadata: %s: "
-			       "bad jh for block %llu: "
-			       "transaction (%p, %u), "
-			       "jh->b_transaction (%p, %u), "
-			       "jh->b_next_transaction (%p, %u), jlist %u\n",
+		/* [NHJ] UFS: jh->b_transaction may not be j_committing_transaction */
+		if (unlikely(jh->b_next_transaction != transaction)) {
+			printk(KERN_ERR "JBD: %s: "
+			       "jh->b_next_transaction (%llu, %p, %u) != "
+			       "transaction (%p, %u)",
 			       journal->j_devname,
 			       (unsigned long long) bh->b_blocknr,
-			       transaction, transaction->t_tid,
-			       jh->b_transaction,
-			       jh->b_transaction ?
-			       jh->b_transaction->t_tid : 0,
 			       jh->b_next_transaction,
 			       jh->b_next_transaction ?
 			       jh->b_next_transaction->t_tid : 0,
-			       jh->b_jlist);
-			WARN_ON(1);
+			       transaction, transaction->t_tid);
 			ret = -EINVAL;
 		}
 		/* And this case is illegal: we can't reuse another
@@ -1398,6 +1518,10 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 
 	BUFFER_TRACE(bh, "entry");
 
+#ifdef CPSETUPWAIT
+repeat:
+#endif
+
 	jbd_lock_bh_state(bh);
 
 	if (!buffer_jbd(bh))
@@ -1411,6 +1535,22 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 		err = -EIO;
 		goto not_jbd;
 	}
+
+        /* [NHJ] UFS */
+#ifdef CPSETUPWAIT
+        if (jh->b_transaction && jh->b_transaction != transaction && jh->b_next_transaction != transaction) {
+                read_lock(&journal->j_state_lock);
+                if (tid_gt(jh->b_transaction->t_tid, journal->j_cpsetup_sequence)) {
+                        wake_up(&journal->j_wait_cpsetup);
+                        read_unlock(&journal->j_state_lock);
+                        spin_unlock(&journal->j_list_lock);
+                        jbd_unlock_bh_state(bh);
+                        wait_event(journal->j_wait_done_cpsetup,  !jh->b_transaction || jh->b_transaction == transaction || jh->b_next_transaction == transaction);
+                        goto repeat;
+                }
+                read_unlock(&journal->j_state_lock);
+        }
+#endif
 
 	/* keep track of whether or not this transaction modified us */
 	was_modified = jh->b_modified;
@@ -1466,8 +1606,7 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 		}
 		spin_unlock(&journal->j_list_lock);
 	} else if (jh->b_transaction) {
-		J_ASSERT_JH(jh, (jh->b_transaction ==
-				 journal->j_committing_transaction));
+		/* [NHJ] UFS */
 		/* However, if the buffer is still owned by a prior
 		 * (committing) transaction, we can't drop it yet... */
 		JBUFFER_TRACE(jh, "belongs to older transaction");
@@ -1477,6 +1616,8 @@ int jbd2_journal_forget (handle_t *handle, struct buffer_head *bh)
 		if (jh->b_next_transaction) {
 			J_ASSERT(jh->b_next_transaction == transaction);
 			spin_lock(&journal->j_list_lock);
+                        atomic_dec(&jh->b_next_transaction->t_conflict_count);
+                        list_del_init(&jh->b_jh_wait_list);
 			jh->b_next_transaction = NULL;
 			spin_unlock(&journal->j_list_lock);
 
@@ -2010,6 +2151,9 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 	 * holding the page lock. --sct
 	 */
 
+#ifdef CPSETUPWAIT
+repeat:
+#endif
 	if (!buffer_jbd(bh))
 		goto zap_buffer_unlocked;
 
@@ -2021,6 +2165,23 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 	jh = jbd2_journal_grab_journal_head(bh);
 	if (!jh)
 		goto zap_buffer_no_jh;
+
+        /* UFS */
+#ifdef CPSETUPWAIT
+        if (jh->b_transaction && !tid_gt(jh->b_transaction->t_tid, journal->j_commit_sequence) && tid_gt(jh->b_transaction->t_tid, journal->j_cpsetup_sequence)) {
+                tid_t tid = jh->b_transaction->t_tid;
+                read_lock(&journal->j_state_lock);
+                if (tid_gt(jh->b_transaction->t_tid, journal->j_cpsetup_sequence)) {
+                        wake_up(&journal->j_wait_cpsetup);
+                        read_unlock(&journal->j_state_lock);
+                        jbd_unlock_bh_state(bh);
+                        spin_unlock(&journal->j_list_lock);       
+                        wait_event(journal->j_wait_done_cpsetup, !tid_geq(tid, journal->j_commit_sequence));
+                        goto repeat;
+                }
+                read_unlock(&journal->j_state_lock);
+        }
+#endif
 
 	/*
 	 * We cannot remove the buffer from checkpoint lists until the
@@ -2090,7 +2251,8 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 				goto zap_buffer;
 			}
 		}
-	} else if (transaction == journal->j_committing_transaction) {
+	/* [NHJ] UFS: transaction != NULL */
+	} else if (transaction == journal->j_committing_transaction || !journal->j_running_transaction || transaction != journal->j_running_transaction) { /* [NHJ] UFS */
 		JBUFFER_TRACE(jh, "on committing transaction");
 		/*
 		 * The buffer is committing, we simply cannot touch
@@ -2111,8 +2273,10 @@ static int journal_unmap_buffer(journal_t *journal, struct buffer_head *bh,
 		 * should clear dirty bits when it is done with the buffer.
 		 */
 		set_buffer_freed(bh);
-		if (journal->j_running_transaction && buffer_jbddirty(bh))
+		if (journal->j_running_transaction && buffer_jbddirty(bh)) {
 			jh->b_next_transaction = journal->j_running_transaction;
+			atomic_inc(&jh->b_next_transaction->t_conflict_count);
+		}
 		jbd2_journal_put_journal_head(jh);
 		spin_unlock(&journal->j_list_lock);
 		jbd_unlock_bh_state(bh);
@@ -2320,6 +2484,8 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 	if (jh->b_transaction)
 		assert_spin_locked(&jh->b_transaction->t_journal->j_list_lock);
 
+	list_del_init(&jh->b_jh_wait_list);
+
 	/* If the buffer is now unused, just drop it. */
 	if (jh->b_next_transaction == NULL) {
 		__jbd2_journal_unfile_buffer(jh);
@@ -2333,12 +2499,16 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 
 	was_dirty = test_clear_buffer_jbddirty(bh);
 	__jbd2_journal_temp_unlink_buffer(jh);
+#ifdef PROACTIVE_SHADOWING_PAGE
+        jh->b_hot = 1;
+#endif  
 	/*
 	 * We set b_transaction here because b_next_transaction will inherit
 	 * our jh reference and thus __jbd2_journal_file_buffer() must not
 	 * take a new one.
 	 */
 	jh->b_transaction = jh->b_next_transaction;
+	atomic_dec(&jh->b_next_transaction->t_conflict_count);
 	jh->b_next_transaction = NULL;
 	if (buffer_freed(bh))
 		jlist = BJ_Forget;
@@ -2347,7 +2517,6 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 	else
 		jlist = BJ_Reserved;
 	__jbd2_journal_file_buffer(jh, jh->b_transaction, jlist);
-	J_ASSERT_JH(jh, jh->b_transaction->t_state == T_RUNNING);
 
 	if (was_dirty)
 		set_buffer_jbddirty(bh);
@@ -2380,6 +2549,10 @@ int jbd2_journal_file_inode(handle_t *handle, struct jbd2_inode *jinode)
 {
 	transaction_t *transaction = handle->h_transaction;
 	journal_t *journal;
+
+#ifdef CPSETUPWAIT
+repeat:
+#endif
 
 	if (is_handle_aborted(handle))
 		return -EROFS;
@@ -2418,12 +2591,21 @@ int jbd2_journal_file_inode(handle_t *handle, struct jbd2_inode *jinode)
 	 */
 	if (!transaction->t_need_data_flush)
 		transaction->t_need_data_flush = 1;
+
+        /* [NHJ] UFS */
+#ifdef CPSETUPWAIT
+        if (jinode->i_next_transaction) {
+                spin_unlock(&journal->j_list_lock);
+                wake_up(&journal->j_wait_cpsetup);
+                wait_event(journal->j_wait_done_cpsetup, !jinode->i_next_transaction);
+                goto repeat;         
+        }
+#endif
 	/* On some different transaction's list - should be
 	 * the committing one */
 	if (jinode->i_transaction) {
 		J_ASSERT(jinode->i_next_transaction == NULL);
-		J_ASSERT(jinode->i_transaction ==
-					journal->j_committing_transaction);
+		/* [NHJ] UFS */
 		jinode->i_next_transaction = transaction;
 		goto done;
 	}
@@ -2461,7 +2643,7 @@ int jbd2_journal_begin_ordered_truncate(journal_t *journal,
 					struct jbd2_inode *jinode,
 					loff_t new_size)
 {
-	transaction_t *inode_trans, *commit_trans;
+	transaction_t *inode_trans = NULL, *commit_trans = NULL;
 	int ret = 0;
 
 	/* This is a quick check to avoid locking if not necessary */
@@ -2471,7 +2653,18 @@ int jbd2_journal_begin_ordered_truncate(journal_t *journal,
 	 * enough that the transaction was not committing before we started
 	 * a transaction adding the inode to orphan list */
 	read_lock(&journal->j_state_lock);
-	commit_trans = journal->j_committing_transaction;
+        /* [NHJ] UFS */
+        commit_trans = NULL;
+        if (journal->j_committing_transaction && jinode->i_transaction == journal->j_committing_transaction)
+                commit_trans = journal->j_committing_transaction;
+        else {
+                spin_lock(&journal->j_cplist_lock);
+                if (journal->j_cpsetup_transactions) {
+                        if (journal->j_cpsetup_sequence < jinode->i_transaction->t_tid && jinode->i_transaction->t_tid < journal->j_commit_sequence)
+                                commit_trans = jinode->i_transaction; 
+                }
+                spin_unlock(&journal->j_cplist_lock);
+        }
 	read_unlock(&journal->j_state_lock);
 	spin_lock(&journal->j_list_lock);
 	inode_trans = jinode->i_transaction;

@@ -109,6 +109,7 @@ enum pageflags {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	PG_compound_lock,
 #endif
+	PG_dispatch,            /* [NHJ] UFS: page dispatch */
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
@@ -242,6 +243,9 @@ PAGEFLAG(MappedToDisk, mappedtodisk)
 PAGEFLAG(Reclaim, reclaim) TESTCLEARFLAG(Reclaim, reclaim)
 PAGEFLAG(Readahead, reclaim) TESTCLEARFLAG(Readahead, reclaim)
 
+/* [NHJ] UFS: page dispatch functions */
+PAGEFLAG(Dispatch, dispatch) TESTSCFLAG(Dispatch, dispatch)
+
 #ifdef CONFIG_HIGHMEM
 /*
  * Must use a macro here due to header dependency issues. page_zone() is not
@@ -336,6 +340,8 @@ int __test_set_page_writeback(struct page *page, bool keep_write);
 static inline void set_page_writeback(struct page *page)
 {
 	test_set_page_writeback(page);
+        /* [NHJ] UFS: dispatch */
+        SetPageDispatch(page);
 }
 
 static inline void set_page_writeback_keepwrite(struct page *page)

@@ -199,6 +199,9 @@ typedef struct journal_block_tag_s
 	__be32		t_blocknr_high; /* most-significant high 32bits. */
 } journal_block_tag_t;
 
+#define JBD2_TAG_SIZE32 (offsetof(journal_block_tag_t, t_blocknr_high))
+#define JBD2_TAG_SIZE64 (sizeof(journal_block_tag_t))
+
 /* Tail of descriptor block, for checksumming */
 struct jbd2_journal_block_tail {
 	__be32		t_checksum;	/* crc32c(uuid+descr_block) */
@@ -338,7 +341,8 @@ BUFFER_FNS(Verified, verified)
 
 #include <linux/jbd_common.h>
 
-#define J_ASSERT(assert)	BUG_ON(!(assert))
+//#define J_ASSERT(assert)     BUG_ON(!(assert))
+#define J_ASSERT(assert)       if (!(assert)) { printk(KERN_ERR "UFS_ASSERT: %s %d\n", __func__, __LINE__);}
 
 #define J_ASSERT_BH(bh, expr)	J_ASSERT(expr)
 #define J_ASSERT_JH(jh, expr)	J_ASSERT(expr)
@@ -652,12 +656,43 @@ struct transaction_s
 	 */
 	struct list_head	t_private_list;
 
-#ifdef OEXT4
-	bool			t_journal_io;
-
-	bool			t_cp_io;
-
-	int			num_io_threads;
+        /* [NHJ] UFS */
+        /* 
+         * It counts how many conflicts have occurred about this transaction.
+         * The transaction can start it commit only when t_conflict_count is
+         * zero so there are no journal heads which are being committed by
+         * other transactions.
+         * 
+         * It is updated with simple rule.
+         * 
+         * When it is increased, it should be updated only after
+         * b_next_transaction field is set.
+         *
+         * When it is decreased, it should be updated only before
+         * b_next_transaction field is set.
+         *
+         * This rule makes simple the code.
+         *
+         * - Joontaek Oh.
+         */
+        atomic_t                t_conflict_count;
+        struct list_head        t_jh_wait_list;
+        struct list_head        io_bufs;
+        struct list_head        log_bufs;
+        struct buffer_head      *cbh;
+ 
+        int                     t_flush_trigger;
+        
+#ifdef INFO_USEC
+        ktime_t t_locked_time;
+        ktime_t t_dispatch_time;
+        ktime_t t_dma_time;
+        ktime_t t_flush_time;
+#endif
+#ifdef DEBUG_COMMIT
+        ktime_t t_start_commit;
+        ktime_t t_end_commit;
+        ktime_t t_intv[4];
 #endif
 };
 
@@ -690,6 +725,74 @@ jbd2_time_diff(unsigned long start, unsigned long end)
 }
 
 #define JBD2_NR_BATCH	64
+
+#ifdef PAGE_CONFLICT_PROFILE
+struct conf_node {
+        unsigned int b_blocknr;
+        unsigned int count;
+        unsigned int wait;
+	struct conf_node *next;
+};
+
+static inline void
+insert_conflict_pn(struct conf_node *pcl, unsigned int b_blocknr, int flag)
+{
+        struct conf_node *iter = pcl;
+        int alloc = 1;
+        
+        while (iter->next) {
+                iter = iter->next;
+                if (iter->b_blocknr == b_blocknr) {
+                        if (!flag) {
+                                iter->count++;
+                        } else {
+                                iter->wait++;
+                        }
+                        alloc = 0;
+                        break;
+                }
+        }
+        
+        if (alloc) {
+                struct conf_node *tmp = kzalloc(sizeof(struct conf_node),GFP_KERNEL);
+                tmp->b_blocknr = b_blocknr;
+                if (!flag) {
+                        tmp->count = 1;
+                } else {
+                        tmp->wait = 1;
+                }
+                tmp->next = NULL;
+                iter->next = tmp;
+        }
+}
+
+static inline void
+free_pcl(struct conf_node *pcl)
+{
+	struct conf_node *iter = pcl;
+        struct conf_node *tmp;
+        
+        while (iter) {
+                tmp = iter->next;
+                kfree(iter);
+                iter = tmp;
+        }
+}
+#endif
+
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+struct committing_node {
+        int count;                   /* Count for merged entry to this node */
+        int committing_count;        /* Recorded count for the number of 
+                                        committing transactions in flight */
+        int conflict_count_max;      /* The number of conflict count when
+                                        the committing_count is recorded.
+                                        Because many entries are merged as a node,
+                                        It only records maximum and minimum value */
+        int conflict_count_min;
+        struct list_head node_list;
+ };
+#endif
 
 /**
  * struct journal_s - The journal_s type is the concrete type associated with
@@ -761,6 +864,7 @@ jbd2_time_diff(unsigned long start, unsigned long end)
  * @j_private: An opaque pointer to fs-private information.
  */
 
+#define DEBUG_JOURNAL
 struct journal_s
 {
 	/* General journaling state flags [j_state_lock] */
@@ -810,6 +914,9 @@ struct journal_s
 	 */
 	transaction_t		*j_checkpoint_transactions;
 
+        /* [NHJ] UFS */
+        transaction_t           *j_cpsetup_transactions;
+
 	/*
 	 * Wait queue for waiting for a locked transaction to start committing,
 	 * or for a barrier lock to be released
@@ -824,6 +931,11 @@ struct journal_s
 
 	/* Wait queue to wait for updates to complete */
 	wait_queue_head_t	j_wait_updates;
+
+        /* UFS: Wait queue to trigger checkpoint list setup */
+        wait_queue_head_t       j_wait_cpsetup;
+        /* UFS: Wait queue for wating for checkpoint list setup to complete */
+        wait_queue_head_t       j_wait_done_cpsetup;
 
 	/* Wait queue to wait for reserved buffer credits to drop */
 	wait_queue_head_t	j_wait_reserved;
@@ -889,6 +1001,8 @@ struct journal_s
 	 * Protects the buffer lists and internal buffer state.
 	 */
 	spinlock_t		j_list_lock;
+        /* UFS */
+        spinlock_t              j_cplist_lock;
 
 	/* Optional inode where we store the journal.  If present, all */
 	/* journal block numbers are mapped into this inode via */
@@ -911,6 +1025,20 @@ struct journal_s
 	 */
 	tid_t			j_commit_sequence;
 
+        /* [NHJ] UFS */
+        tid_t                   j_cpsetup_sequence;
+        tid_t                   j_cpsetup_request;
+        tid_t                   j_flush_sequence;
+ 
+#ifdef SHADOW_PAGE_POOL
+         struct list_head	*j_shadow_head_pool;
+ 
+         struct list_head 	*j_full_shadow_pool;
+ 
+         int                    j_shadow_pool_count;
+#endif
+
+
 	/*
 	 * Sequence number of the most recent transaction wanting commit
 	 * [j_state_lock]
@@ -927,6 +1055,9 @@ struct journal_s
 
 	/* Pointer to the current commit thread for this journal */
 	struct task_struct	*j_task;
+
+        /* [NHJ] UFS: pinter to the current cpsetup thread for this journal */
+        struct task_struct      *j_cptask;
 
 	/*
 	 * Maximum number of metadata buffers to allow in a single compound
@@ -999,9 +1130,140 @@ struct journal_s
 	/* Reference to checksum algorithm driver via cryptoapi */
 	struct crypto_shash *j_chksum_driver;
 
+#ifdef JBD2_BARRIER_COMMITTING_TX
+        /* The number of committing transacitons in flight.
+         * It is recorded in j_committing_tx_list in each commit. */
+        atomic_t j_committing_transactions;
+ 
+        /* The number of record without merge.
+         * If there are records which have same value on committing_count,
+         * they are merged to one node. */
+//     int j_committing_list_count;
+ 
+        /*
+         * The number of record with merge.
+         * This is actual count of node in j_committing_tx_list.
+         * Actually, I added this member and j_committing_list_count
+         * for debugging. But I leave them because they are useful so
+         * they could be used again.
+         */
+//     int j_committing_node_count;
+ 
+        /*
+         * The list to record how many committing transactions
+         * in flight.
+         */
+//     struct committing_node *j_committing_tx_list;
+#endif
+
 	/* Precomputed journal UUID checksum for seeding other checksums */
 	__u32 j_csum_seed;
+
+#ifdef PAGE_CONFLICT_PROFILE
+        spinlock_t      j_pcl_lock;
+        struct conf_node *pcl;
+#endif
+ 
+#ifdef SHADOW_PAGE_POOL
+struct shadow_head {
+        journal_t * journal;
+        struct list_head b_sh_full_list;
+        struct list_head b_sh_pool_list;
+        char * b_frozen;
+} shadow_head;
+#endif
+#ifdef INFO_USEC
+        u64                     j_average_running;
+        u64                     j_average_locked;
+        u64                     j_average_dispatch;
+        u64                     j_average_dma;
+        u64                     j_average_flush;
+#endif
 };
+
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+static inline void
+insert_committing_node(journal_t *journal, int committing_count, int conflict_count)
+{
+        journal->j_committing_list_count++;
+        if (!journal->j_committing_tx_list) {
+                /* 
+                 * If j_committing_tx_list is NULL, it is first time to record. 
+                 * So we have to allocate head entry and save its value in 
+                 * journal->j_committing_tx_list.
+                 * I didn't use GFP_KERNEL flag for kzalloc, because it casue
+                 * stock waiting for the return of kzalloc().
+                 * I couldn't figure the reason out.
+                 * -Joontaek Oh
+                 */
+                journal->j_committing_tx_list = kzalloc(sizeof(struct committing_node), 0);
+                if (!journal->j_committing_tx_list) {
+                        printk("[JATA DEBUG] (%s) Out of Memory\n", __func__);
+                        BUG_ON(1);
+                }
+                journal->j_committing_tx_list->committing_count = committing_count;
+                journal->j_committing_tx_list->conflict_count_max = conflict_count;
+                journal->j_committing_tx_list->conflict_count_min = conflict_count;
+                journal->j_committing_tx_list->count = 1;
+                INIT_LIST_HEAD(&journal->j_committing_tx_list->node_list);
+ 
+                journal->j_committing_node_count++;
+        } else {
+                struct committing_node *node, *tail;
+ 
+                tail = list_last_entry(&journal->j_committing_tx_list->node_list, struct committing_node, node_list);
+                if (tail->committing_count == committing_count) {
+                        /* 
+                         * If the committing_count is same with the value in last entry,
+                         * They can be merged. For merging them, just increase count and
+                         * update maximum and minimum value of conflict count.
+                         * - Joontaek Oh.
+                         */
+                        tail->count++;
+                        tail->conflict_count_max = (tail->conflict_count_max < conflict_count) ? 
+                                                   conflict_count : tail->conflict_count_max;
+                        tail->conflict_count_min = (tail->conflict_count_min > conflict_count) ? 
+                                                   conflict_count : tail->conflict_count_max;
+                } else {
+                        /*
+                         * Just allocate new entry and push it to
+                         * journal->j_committing_tx_list.
+                         * - Joontaek Oh.
+                         */
+                        node = kzalloc(sizeof(struct committing_node), 0);
+                        if (!node) {
+                                printk("[JATA DEBUG] (%s) Out of Memory\n", __func__);
+                                BUG_ON(1);
+                        }
+                        node->committing_count = committing_count;
+                        node->conflict_count_max = conflict_count;
+                        node->conflict_count_min = conflict_count;
+                        node->count = 1;
+                        journal->j_committing_node_count++;
+                        list_add_tail(&node->node_list, &journal->j_committing_tx_list->node_list);
+                }
+        }
+}
+
+static inline void
+free_committing_node_list(journal_t *journal)
+{
+        struct committing_node *head, *cur, *tmp;
+ 
+        head = journal->j_committing_tx_list;
+ 
+        if (!head)
+                return;
+ 
+        list_for_each_entry_safe(cur, tmp, &head->node_list, node_list) {
+                list_del_init(&cur->node_list);
+                kfree(cur);
+        }
+ 
+        journal->j_committing_tx_list = NULL;
+}
+#endif
+
 
 /*
  * Journal flag definitions
@@ -1048,6 +1310,9 @@ void jbd2_update_log_tail(journal_t *journal, tid_t tid, unsigned long block);
 
 /* Commit management */
 extern void jbd2_journal_commit_transaction(journal_t *);
+/* UFS: Commit management */
+extern void jbd2_journal_barrier_commit_transaction(journal_t *);
+extern void jbd2_journal_cpsetup_transaction(journal_t *);
 
 /* Checkpoint list management */
 void __jbd2_journal_clean_checkpoint_list(journal_t *journal);
@@ -1165,8 +1430,9 @@ extern int	   jbd2_journal_recover    (journal_t *journal);
 extern int	   jbd2_journal_wipe       (journal_t *, int);
 extern int	   jbd2_journal_skip_recovery	(journal_t *);
 extern void	   jbd2_journal_update_sb_errno(journal_t *);
+/* [NHJ] UFS: int -> long long */
 extern int	   jbd2_journal_update_sb_log_tail	(journal_t *, tid_t,
-				unsigned long, int);
+				unsigned long, long long);
 extern void	   __jbd2_journal_abort_hard	(journal_t *);
 extern void	   jbd2_journal_abort      (journal_t *, int);
 extern int	   jbd2_journal_errno      (journal_t *);
@@ -1240,6 +1506,11 @@ extern void	jbd2_journal_clear_revoke(journal_t *);
 extern void	jbd2_journal_switch_revoke_table(journal_t *journal);
 extern void	jbd2_clear_buffer_revoked_flags(journal_t *journal);
 
+/* [NHJ] UFS */
+int jbd2_log_wait_cpsetup(journal_t *journal, tid_t tid);
+int jbd2_complete_cpsetup_transaction(journal_t *journal, tid_t tid);
+int jbd2_flush_transaction(journal_t *journal, tid_t tid);
+
 /*
  * The log thread user interface:
  *
@@ -1249,6 +1520,9 @@ extern void	jbd2_clear_buffer_revoked_flags(journal_t *journal);
 
 int jbd2_log_start_commit(journal_t *journal, tid_t tid);
 int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
+/* [NHJ] UFS */
+int jbd2_log_flush_commit(journal_t *journal, tid_t tid);
+int __jbd2_log_flush_commit(journal_t *journal, tid_t tid);
 int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
 int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
 int jbd2_complete_transaction(journal_t *journal, tid_t tid);

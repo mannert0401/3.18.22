@@ -1,6 +1,10 @@
 #
 # General architecture dependent options
 #
+# Modifications by Kyungho koo
+#  - adding MOST config 2020.5
+config MOST
+	bool "Enable Mobile Storage Analyzer (MOST)"
 
 config OPROFILE
 	tristate "OProfile system profiling"

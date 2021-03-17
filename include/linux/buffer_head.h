@@ -16,6 +16,9 @@
 
 #ifdef CONFIG_BLOCK
 
+#define INODE_FORCE_SHADOWING                  (1 << 1)
+
+
 enum bh_state_bits {
 	BH_Uptodate,	/* Contains valid data */
 	BH_Dirty,	/* Is dirty */
@@ -37,6 +40,8 @@ enum bh_state_bits {
 	BH_Meta,	/* Buffer contains metadata */
 	BH_Prio,	/* Buffer should be submitted with REQ_PRIO */
 	BH_Defer_Completion, /* Defer AIO completion to workqueue */
+        BH_Sync_Flush,
+        BH_Dispatch,    /* [NHJ UFS: Buffer dispatched */
 
 	BH_PrivateStart,/* not a state bit, but the first bit available
 			 * for private allocation by other entities
@@ -74,6 +79,9 @@ struct buffer_head {
 	struct list_head b_assoc_buffers; /* associated with another mapping */
 	struct address_space *b_assoc_map;	/* mapping this buffer is
 						   associated with */
+#ifdef INODE_FORCE_SHADOWING
+        int isinode;
+#endif
 	atomic_t b_count;		/* users using this buffer_head */
 };
 
@@ -130,6 +138,11 @@ BUFFER_FNS(Unwritten, unwritten)
 BUFFER_FNS(Meta, meta)
 BUFFER_FNS(Prio, prio)
 BUFFER_FNS(Defer_Completion, defer_completion)
+BUFFER_FNS(Sync_Flush, sync_flush)
+
+/* [NHJ] UFS: FNS for dispatch */
+BUFFER_FNS(Dispatch, dispatch)
+TAS_BUFFER_FNS(Dispatch, dispatch)
 
 #define bh_offset(bh)		((unsigned long)(bh)->b_data & ~PAGE_MASK)
 
@@ -149,6 +162,7 @@ void buffer_check_dirty_writeback(struct page *page,
  */
 
 void mark_buffer_dirty(struct buffer_head *bh);
+void mark_buffer_dirty_sync(struct buffer_head *bh);
 void init_buffer(struct buffer_head *, bh_end_io_t *, void *);
 void touch_buffer(struct buffer_head *bh);
 void set_bh_page(struct buffer_head *bh,
@@ -193,6 +207,13 @@ int __sync_dirty_buffer(struct buffer_head *bh, int rw);
 void write_dirty_buffer(struct buffer_head *bh, int rw);
 int _submit_bh(int rw, struct buffer_head *bh, unsigned long bio_flags);
 int submit_bh(int, struct buffer_head *);
+/* [NHJ UFS */
+void __lock_buffer_dispatch(struct buffer_head *bh);
+int dispatch_bio_bh(struct bio *bio);
+int _submit_bh64(long long rw, struct buffer_head *bh, unsigned long long bio_flags);
+int submit_bh64(long long rw, struct buffer_head *bh);
+
+
 void write_boundary_block(struct block_device *bdev,
 			sector_t bblock, unsigned blocksize);
 int bh_uptodate_or_lock(struct buffer_head *bh);
@@ -380,8 +401,34 @@ __bread(struct block_device *bdev, sector_t block, unsigned size)
 {
 	return __bread_gfp(bdev, block, size, __GFP_MOVABLE);
 }
-
 extern int __set_page_dirty_buffers(struct page *page);
+/* UFS: Buffer head */
+void __wait_on_buffer_dispatch(struct buffer_head *bh);
+static inline int trylock_buffer_dispatch(struct buffer_head *bh)
+{
+	return !test_and_set_bit_lock(BH_Dispatch, &bh->b_state);
+}
+static inline void lock_buffer_dispatch(struct buffer_head *bh)
+{
+	trylock_buffer_dispatch(bh);
+	//if(!trylock_buffer_dispatch(bh))
+	//__lock_buffer_dispatch(bh);
+}
+static inline void wait_on_buffer_dispatch(struct buffer_head *bh)
+{   
+	if (buffer_dispatch(bh))
+		__wait_on_buffer_dispatch(bh);
+}
+
+static inline void wake_up_buffer_dispatch(struct buffer_head *bh)
+{
+	clear_bit_unlock(BH_Dispatch, &bh->b_state);
+	//if (test_clear_buffer_dispatch(bh)) {
+	smp_mb__after_clear_bit();
+	wake_up_bit(&bh->b_state, BH_Dispatch);
+	//}
+}
+
 
 #else /* CONFIG_BLOCK */
 

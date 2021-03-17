@@ -7598,7 +7598,7 @@ static void btrfs_end_dio_bio(struct bio *bio, int err)
 
 	if (err)
 		btrfs_warn(BTRFS_I(dip->inode)->root->fs_info,
-			   "direct IO failed ino %llu rw %lu sector %#Lx len %u err no %d",
+			   "direct IO failed ino %llu rw %llu sector %#Lx len %u err no %d",
 			   btrfs_ino(dip->inode), bio->bi_rw,
 			   (unsigned long long)bio->bi_iter.bi_sector,
 			   bio->bi_iter.bi_size, err);

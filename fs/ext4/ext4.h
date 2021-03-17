@@ -200,7 +200,7 @@ typedef struct ext4_io_end {
 } ext4_io_end_t;
 
 struct ext4_io_submit {
-	int			io_op;
+	long long		io_op; /* [NHJ] UFS */
 	struct bio		*io_bio;
 	ext4_io_end_t		*io_end;
 	sector_t		io_next_block;
@@ -2035,6 +2035,10 @@ extern int ext4_check_all_de(struct inode *dir, struct buffer_head *bh,
 
 /* fsync.c */
 extern int ext4_sync_file(struct file *, loff_t, loff_t, int);
+
+/* [NHJ] UFS project */
+extern int ext4_flush_unwritten_io(struct inode *);
+extern int ext4_fbarrier_file(struct file *, loff_t, loff_t, int);
 
 /* hash.c */
 extern int ext4fs_dirhash(const char *name, int len, struct

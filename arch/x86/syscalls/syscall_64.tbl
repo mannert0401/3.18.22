@@ -328,7 +328,9 @@
 319	common	memfd_create		sys_memfd_create
 320	common	kexec_file_load		sys_kexec_file_load
 321	common	bpf			sys_bpf
-
+327	common  fbarrier		sys_fbarrier
+328	common	fdatabarrier		sys_fdatabarrier
+329	common	mycall			sys_mycall
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
 # for native 64-bit operation.

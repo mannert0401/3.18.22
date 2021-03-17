@@ -434,6 +434,17 @@ void blk_insert_flush(struct request *rq)
 	blk_flush_complete_seq(rq, fq, REQ_FSEQ_ACTIONS & ~policy, 0);
 }
 
+static void bio_end_flush(struct bio *bio, int err)
+{
+        if (err)
+                clear_bit(BIO_UPTODATE, &bio->bi_flags);
+        if (bio->bi_private)
+                complete(bio->bi_private);
+        bio_put(bio);
+}
+
+
+
 /**
  * blkdev_issue_flush - queue a flush
  * @bdev:	blockdev to issue flush for
@@ -486,6 +497,79 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 	return ret;
 }
 EXPORT_SYMBOL(blkdev_issue_flush);
+
+/*
+ * blkdev_issue_barrier - queue a barrier
+ * @bdev : 	blockdev to issue flush for
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ * @error_sector:	error sector
+ *
+ * Description:
+ * 	Issue a barrier commnad to block device with dummy bio.
+ * 	While blkdev_issue_flush() issue flush as set WRITE_FLUSH
+ * 	flag to bio, blkdev_issue_barrier() issue barrier command
+ * 	as use WRITE_BARRIER flag. Any processes including error
+ * 	handling are same with blkdev_issue_flush().
+ *
+ * 	 - Joontaek Oh.
+ */
+int blkdev_issue_barrier(struct block_device *bdev, gfp_t gfp_mask,
+		sector_t *error_sector)
+{
+	DECLARE_COMPLETION_ONSTACK(wait);
+	struct request_queue *q;
+	struct bio *bio;
+	int ret = 0;
+	//struct blk_plug plug;
+	
+	if (bdev->bd_disk == NULL)
+		return -ENXIO;
+
+	q = bdev_get_queue(bdev);
+	if (!q)
+		return -ENXIO;
+
+	if (!q->make_request_fn)
+		return -ENXIO;
+
+	/*
+	 * A complete function can be same with blkdev_issue_flush.
+	 * A complete function of blkdev_issue_flush is bio_end_flush.
+	 * The bio_end_flush just send complete signal to caller that
+	 * called blkdev_issue_barrier through the wait and just handle
+	 * errors. So, a complete function of blkdeV_issue_barrier is
+	 * also bio_end_flush.
+	 *
+	 * As a unnecessary comments, I thought that the complete
+	 * function is not needed in blkdev_issue_barrier. The role
+	 * of barrier command is just ordering between durability
+	 * of requests. so, the host not need to wait for dummy bio
+	 * with BARRIER command. However, I added it once because
+	 * it may needed because of error hnadling.
+	 *
+	 * -Joontaek Oh.
+	 */
+        bio = bio_alloc(gfp_mask, 0);
+        bio->bi_end_io = bio_end_flush;
+        bio->bi_bdev = bdev;
+        bio->bi_private = &wait;
+
+        bio_get(bio);
+        submit_bio(WRITE_BARRIER, bio);
+
+       /*
+        * The driver must store the error location in ->bi_sector, if
+        * it supports it. For non-stacked drivers, this should be
+        * copied from blk_rq_pos(rq).
+        */
+
+        if (!bio_flagged(bio, BIO_UPTODATE))
+                ret = -EIO;
+
+        bio_put(bio);
+        return ret;
+}
+EXPORT_SYMBOL(blkdev_issue_barrier);
 
 struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
 		int node, int cmd_size)

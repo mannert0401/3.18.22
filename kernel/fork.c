@@ -321,6 +321,12 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
 	if (err)
 		goto free_ti;
 
+        /* [NHJ] UFS */
+        tsk->epoch = 0;
+        tsk->__epoch = 0;
+        tsk->barrier_fail = 0;
+        tsk->epoch_fail = 0;
+
 	tsk->stack = ti;
 #ifdef CONFIG_SECCOMP
 	/*

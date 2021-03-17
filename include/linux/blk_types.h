@@ -47,9 +47,12 @@ struct bio {
 	struct bio		*bi_next;	/* request queue link */
 	struct block_device	*bi_bdev;
 	unsigned long		bi_flags;	/* status, command, etc */
-	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
+	/*unsigned long		bi_rw;*/	/* bottom bits READ/WRITE,
 						 * top bits priority
 						 */
+        unsigned long long      bi_rw;          /* UFS */
+        struct epoch            *bi_epoch;      /* UFS epoch */
+
 
 	struct bvec_iter	bi_iter;
 
@@ -193,6 +196,9 @@ enum rq_flag_bits {
 	__REQ_HASHED,		/* on IO scheduler merge hash */
 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
 	__REQ_NR_BITS,		/* stops here */
+        /* [NHJ] UFS project flag */
+        __REQ_ORDERED, 		/* [NHJ] UFS: req for ordering guarantee */
+        __REQ_BARRIER,  	/* [NHJ] UFS: post barrier flags */
 };
 
 #define REQ_WRITE		(1ULL << __REQ_WRITE)
@@ -206,6 +212,11 @@ enum rq_flag_bits {
 #define REQ_WRITE_SAME		(1ULL << __REQ_WRITE_SAME)
 #define REQ_NOIDLE		(1ULL << __REQ_NOIDLE)
 #define REQ_INTEGRITY		(1ULL << __REQ_INTEGRITY)
+
+// [NHJ] UFS project
+#define REQ_ORDERED     	(1ULL << __REQ_ORDERED)
+#define REQ_BARRIER     	(1ULL << __REQ_BARRIER)
+
 
 #define REQ_FAILFAST_MASK \
 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)

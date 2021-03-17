@@ -38,6 +38,12 @@ struct bsg_job;
 struct blkcg_gq;
 struct blk_flush_queue;
 
+/* UFS: epoch link between requests and epoch */
+struct epoch_link {
+        struct epoch *el_epoch;
+        struct epoch_link *el_next;
+};
+
 #define BLKDEV_MIN_RQ	4
 #define BLKDEV_MAX_RQ	128	/* Default maximum */
 
@@ -108,6 +114,8 @@ struct request {
 	struct blk_mq_ctx *mq_ctx;
 
 	u64 cmd_flags;
+	unsigned long long cmd_bflags;  /* UFS: barrier flags */
+
 	enum rq_cmd_type_bits cmd_type;
 	unsigned long atomic_flags;
 
@@ -209,6 +217,11 @@ struct request {
 
 	/* for bidi */
 	struct request *next_rq;
+
+        /* for UFS */
+        struct epoch_link *epoch_link;
+        struct epoch_link *epoch_link_tail;
+        //struct list_head epoch_req_list;
 };
 
 static inline unsigned short req_get_ioprio(struct request *req)
@@ -478,6 +491,12 @@ struct request_queue {
 	struct throtl_data *td;
 #endif
 	struct rcu_head		rcu_head;
+
+        /* UFS: for epoch allocation */
+        mempool_t *epoch_pool;
+        mempool_t *epoch_link_pool;
+
+
 	wait_queue_head_t	mq_freeze_wq;
 	struct percpu_ref	mq_usage_counter;
 	struct list_head	all_q_node;
@@ -1147,6 +1166,25 @@ extern void blk_queue_invalidate_tags(struct request_queue *);
 extern struct blk_queue_tag *blk_init_tags(int);
 extern void blk_free_tags(struct blk_queue_tag *);
 
+/* UFS blk function */
+static inline void get_epoch(struct epoch *epoch)
+{
+         atomic_inc(&epoch->e_count);
+}
+static inline void put_epoch(struct epoch *epoch)
+{
+         smp_mb__before_atomic_dec();
+         atomic_dec(&epoch->e_count);
+}
+ 
+extern void blk_issue_barrier_plug(struct blk_plug *);
+extern void blk_request_dispatched(struct request *req);
+extern void blk_start_new_epoch(struct request_queue *q);
+//extern void blk_start_epoch(void);
+extern void blk_start_epoch(struct request_queue *q);
+extern void blk_finish_epoch(void);
+
+
 static inline struct request *blk_map_queue_find_tag(struct blk_queue_tag *bqt,
 						int tag)
 {
@@ -1158,6 +1196,7 @@ static inline struct request *blk_map_queue_find_tag(struct blk_queue_tag *bqt,
 #define BLKDEV_DISCARD_SECURE  0x01    /* secure discard */
 
 extern int blkdev_issue_flush(struct block_device *, gfp_t, sector_t *);
+extern int blkdev_issue_barrier(struct block_device *, gfp_t, sector_t *);
 extern int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask, unsigned long flags);
 extern int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,

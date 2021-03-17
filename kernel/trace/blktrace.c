@@ -194,6 +194,22 @@ static const u32 ddir_act[2] = { BLK_TC_ACT(BLK_TC_READ),
 #define MASK_TC_BIT(rw, __name) ((rw & REQ_ ## __name) << \
 	  (ilog2(BLK_TC_ ## __name) + BLK_TC_SHIFT - __REQ_ ## __name))
 
+#ifdef CONFIG_MOST
+#define MOST_TABLE_SIZE 500
+struct blk_req_table
+{
+        pid_t pid;
+        sector_t sector;
+        int count;
+        int temp_file;
+        unsigned char d_iname[40]; /* small names */
+};
+
+extern struct blk_req_table gblk_req_table[MOST_TABLE_SIZE];
+extern int gblk_current;
+#endif
+
+
 /*
  * The worker for the various blk_add_trace*() types. Fills out a
  * blk_io_trace structure and places it in a per-cpu subbuffer.
@@ -211,6 +227,14 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
 	int cpu, pc = 0;
 	bool blk_tracer = blk_tracer_enabled;
 
+#ifdef CONFIG_MOST
+        int gblk_index, loop_count;
+        sector_t sector_trans;
+        struct task_struct *tsk_orig = NULL;
+        int temp_file;
+#endif
+
+
 	if (unlikely(bt->trace_state != Blktrace_running && !blk_tracer))
 		return;
 
@@ -227,6 +251,39 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
 		return;
 	cpu = raw_smp_processor_id();
 
+#ifdef CONFIG_MOST
+        loop_count = MOST_TABLE_SIZE - 1;
+        
+        if (gblk_current == 0)
+                gblk_index = MOST_TABLE_SIZE - 1;
+        else
+                gblk_index = gblk_current - 1;
+ 
+        if (sector >= 2048)
+                sector_trans = sector - 2048;
+        else
+                sector_trans = 0;
+        temp_file = 0;
+
+        do
+        {
+                if (sector_trans == gblk_req_table[gblk_index].sector)
+                {
+                        pid = gblk_req_table[gblk_index].pid;
+                        temp_file = gblk_req_table[gblk_index].temp_file;
+ 
+                        tsk_orig = find_task_by_vpid(pid);
+                        pid = pid + temp_file;
+                        break;
+                }
+                if (gblk_index == 0)
+                        gblk_index = MOST_TABLE_SIZE - 1;
+                else
+                        gblk_index--;
+        } while (loop_count--); 
+#endif
+
+
 	if (blk_tracer) {
 		tracing_record_cmdline(current);
 
@@ -241,15 +298,26 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
 		goto record_it;
 	}
 
-	if (unlikely(tsk->btrace_seq != blktrace_seq))
-		trace_note_tsk(tsk);
-
 	/*
 	 * A word about the locking here - we disable interrupts to reserve
 	 * some space in the relay per-cpu buffer, to prevent an irq
 	 * from coming in and stepping on our toes.
 	 */
 	local_irq_save(flags);
+
+#ifdef CONFIG_MOST
+        if (tsk_orig != NULL)
+        {
+                tsk_orig->btrace_seq = blktrace_seq;
+                trace_note(bt, pid, BLK_TN_PROCESS, tsk_orig->comm, sizeof(tsk_orig->comm));
+        }
+        else
+                trace_note_tsk(bt, tsk);
+#else
+	if (unlikely(tsk->btrace_seq != blktrace_seq))
+		trace_note_tsk(tsk);
+#endif
+
 	t = relay_reserve(bt->rchan, sizeof(*t) + pdu_len);
 	if (t) {
 		sequence = per_cpu_ptr(bt->sequence, cpu);

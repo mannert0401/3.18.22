@@ -360,6 +360,33 @@ int blkdev_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 }
 EXPORT_SYMBOL(blkdev_fsync);
 
+// [NHJ] UFS project
+int blkdev_fbarrier(struct file *filp, loff_t start, loff_t end, int datasync)
+{
+        struct inode *bd_inode = filp->f_mapping->host;
+        struct block_device *bdev = I_BDEV(bd_inode);
+        int error;
+        
+        error = filemap_write_and_wait_range(filp->f_mapping, start, end);
+        if (error)
+                return error;
+
+        /*
+         * There is no need to serialise calls to blkdev_issue_flush with
+         * i_mutex and doing so causes performance issues with concurrent
+         * O_SYNC writers to a block device.
+         */
+        error = blkdev_issue_flush(bdev, GFP_KERNEL, NULL);
+        if (error == -EOPNOTSUPP)
+                error = 0;
+
+        return error;
+}
+EXPORT_SYMBOL(blkdev_fbarrier);
+
+
+
+
 /**
  * bdev_read_page() - Start reading a page from a block device
  * @bdev: The device to read the page from
@@ -1643,6 +1670,8 @@ const struct file_operations def_blk_fops = {
 #endif
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= iter_file_splice_write,
+	// [NHJ] UFS project
+	.fbarrier 	= blkdev_fbarrier,
 };
 
 int ioctl_by_bdev(struct block_device *bdev, unsigned cmd, unsigned long arg)

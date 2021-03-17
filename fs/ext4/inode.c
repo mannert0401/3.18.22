@@ -2204,7 +2204,10 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
 	ext4_lblk_t lblk;
 	struct buffer_head *head;
 
-	if (mpd->wbc->sync_mode == WB_SYNC_ALL || mpd->wbc->tagged_writepages)
+	if (mpd->wbc->sync_mode == WB_SYNC_ALL || 
+/* [NHJ] UFS */ mpd->wbc->sync_mode == WB_ORDERED_ALL || 
+		mpd->wbc->sync_mode == WB_BARRIER_ALL || 
+		mpd->wbc->tagged_writepages)
 		tag = PAGECACHE_TAG_TOWRITE;
 	else
 		tag = PAGECACHE_TAG_DIRTY;
@@ -2392,6 +2395,10 @@ static int ext4_writepages(struct address_space *mapping,
 retry:
 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
 		tag_pages_for_writeback(mapping, mpd.first_page, mpd.last_page);
+        /* [NHJ]UFS */
+        if (wbc->sync_mode == WB_ORDERED_ALL || wbc->sync_mode == WB_BARRIER_ALL)
+                tag_pages_for_writeback(mapping, mpd.first_page, mpd.last_page);
+
 	done = false;
 	blk_start_plug(&plug);
 	while (!done && mpd.first_page <= mpd.last_page) {
@@ -2463,6 +2470,12 @@ retry:
 		if (ret)
 			break;
 	}
+
+	/* [NHJ] UFS */
+	if (wbc->sync_mode == WB_BARRIER_ALL) {
+		blk_issue_barrier_plug(&plug);
+	}
+
 	blk_finish_plug(&plug);
 	if (!ret && !cycled && wbc->nr_to_write > 0) {
 		cycled = 1;
@@ -3821,6 +3834,9 @@ make_io:
 		}
 	}
 has_buffer:
+#ifdef INODE_FORCE_SHADOWING
+	bh->isinode |= INODE_FORCE_SHADOWING;
+#endif
 	iloc->bh = bh;
 	return 0;
 }

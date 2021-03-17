@@ -526,6 +526,16 @@ static inline void wait_on_page_writeback(struct page *page)
 extern void end_page_writeback(struct page *page);
 void wait_for_stable_page(struct page *page);
 
+/* [NHJ] UFS */
+static inline void wait_on_page_dispatch(struct page *page)
+{
+       if (PageDispatch(page)) {       
+               //printk("[%s]wait on page dispatch!\n", __func__);
+               wait_on_page_bit(page, PG_dispatch);
+       }
+}
+extern void end_page_dispatch(struct page *page);
+
 void page_endio(struct page *page, int rw, int err);
 
 /*

@@ -10,11 +10,22 @@
 #ifndef JOURNAL_HEAD_H_INCLUDED
 #define JOURNAL_HEAD_H_INCLUDED
 
+#define PROACTIVE_SHADOWING_PAGE               (1 << 0)
+//#define INODE_FORCE_SHADOWING                (1 << 1) -> buffer_head.h
+#define ENTIRE_FORCE_SHADOWING                 (1 << 2)
+#define DELAY_ON_COMMIT_WITH_LOOP              (1 << 3)
+#define JBD2_BARRIER_CONFLICT_COUNT            (1 << 4)
+#define DEBUG_CONFLICT_COUNT                   (1 << 5)
+#define SHADOW_PAGE_POOL                       (1 << 6)
+#define TRY_COMMIT                             (1 << 7)
+
+//#define PAGE_CONFLICT_PROFILE
+#define INITIALIZE_INFO
+//#define JBD2_BARRIER_COMMITTING_TX
+//#define INFO_USEC
+
 typedef unsigned int		tid_t;		/* Unique transaction ID */
 typedef struct transaction_s	transaction_t;	/* Compound transaction type */
-
-
-#define OEXT4
 
 
 struct buffer_head;
@@ -24,6 +35,10 @@ struct journal_head {
 	 * Points back to our buffer_head. [jbd_lock_bh_journal_head()]
 	 */
 	struct buffer_head *b_bh;
+
+#ifdef PROACTIVE_SHADOWING_PAGE
+        unsigned b_hot; 
+#endif 
 
 	/*
 	 * Reference count - see description in journal.c
@@ -105,13 +120,12 @@ struct journal_head {
 	/* Trigger type for the committing transaction's frozen data */
 	struct jbd2_buffer_trigger_type *b_frozen_triggers;
 
-#ifdef OEXT4
-	struct journal_head * gc_prev;
+        /* [NHJ] UFS */
+        struct list_head b_jh_wait_list;
 
-	struct journal_head * gc_next;
-	
-	bool	b_removed;
+#ifdef SHADOW_PAGE_POOL
+        struct shadow_head * f_shadow_head;
+        struct shadow_head * c_shadow_head;
 #endif
 };
-
 #endif		/* JOURNAL_HEAD_H_INCLUDED */

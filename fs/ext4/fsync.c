@@ -113,7 +113,10 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		goto out;
 	}
 
-	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	if (datasync)
+		ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	else
+		ret = filemap_write_and_dispatch_range(inode->i_mapping, start, end);
 	if (ret)
 		return ret;
 	/*
@@ -139,8 +142,10 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	if (journal->j_flags & JBD2_BARRIER &&
 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
 		needs_barrier = true;
-	ret = jbd2_complete_transaction(journal, commit_tid);
+	//ret = jbd2_complete_transaction(journal, commit_tid);
+	ret = jbd2_complete_cpsetup_transaction(journal, commit_tid);
 	if (needs_barrier) {
+		filemap_fdatawait_range(inode->i_mapping, start, end);
 		err = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
 		if (!ret)
 			ret = err;
@@ -149,3 +154,83 @@ out:
 	trace_ext4_sync_file_exit(inode, ret);
 	return ret;
 }
+
+/*
+ * [NHJ] UFS project add
+ * ext4_sync_file copy.
+*/
+int ext4_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync)
+{
+       struct inode *inode = file->f_mapping->host;
+       struct ext4_inode_info *ei = EXT4_I(inode);
+       journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
+       int ret = 0/*, err*/;
+       tid_t commit_tid;
+       bool needs_barrier = false;
+
+       J_ASSERT(ext4_journal_current_handle() == NULL);
+
+       trace_ext4_sync_file_enter(file, datasync);
+
+       if (inode->i_sb->s_flags & MS_RDONLY) {
+               /* Make sure that we read updated s_mount_flags value */
+               smp_rmb();
+               if (EXT4_SB(inode->i_sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
+                       ret = -EROFS;
+               goto out;
+       }
+
+       if (!journal) {
+               ret = generic_file_fsync(file, start, end, datasync);
+               if (!ret && !hlist_empty(&inode->i_dentry))
+                       ret = ext4_sync_parent(inode);
+               goto out;
+       }
+
+       if (datasync) {
+               current->barrier_fail = 0;
+               ret = filemap_ordered_write_range(inode->i_mapping, start, end);
+               if (current->barrier_fail)
+                       needs_barrier = true;
+               ret = filemap_fdatadispatch_range(inode->i_mapping, start, end);
+       }
+       else
+               ret = filemap_write_and_dispatch_range(inode->i_mapping, start, end);
+
+       if (ret)
+               return ret;
+
+       /*
+        * data=writeback,ordered:
+        *  The caller's filemap_fdatawrite()/wait will sync the data.
+        *  Metadata is in the journal, we wait for proper transaction to
+        *  commit here.
+        *
+        * data=journal:
+        *  filemap_fdatawrite won't do anything (the buffers are clean).
+        *  ext4_force_commit will write the file data into the journal and
+        *  will wait on that.
+        *  filemap_fdatawait() will encounter a ton of newly-dirtied pages
+        *  (they were dirtied by commit).  But that's OK - the blocks are
+        *  safe in-journal, which is all fsync() needs to ensure.
+        */
+       if (ext4_should_journal_data(inode)) {
+               ret = ext4_force_commit(inode->i_sb);
+               goto out;
+       }
+
+       commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+
+       if (datasync && needs_barrier) {
+               printk(KERN_ERR "UFS: %s: BARRIER_FAIL\n", __func__);
+               commit_tid = ei->i_sync_tid;
+               current->barrier_fail = 0;
+       }
+       
+       ret = jbd2_complete_transaction(journal, commit_tid);
+
+out:
+       trace_ext4_sync_file_exit(inode, ret);
+       return ret;
+}
+

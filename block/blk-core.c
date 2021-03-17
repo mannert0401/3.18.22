@@ -48,6 +48,22 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
 
 DEFINE_IDA(blk_queue_ida);
 
+/* [NHJ] Used for Barrier */
+#ifdef CONFIG_MOST
+#define MOST_TABLE_SIZE 500
+struct blk_req_table
+{
+	pid_t pid;
+	sector_t sector;
+	int count;
+	int temp_file;
+	unsigned char d_iname[40];
+};
+
+struct blk_req_table gblk_req_table[MOST_TABLE_SIZE];
+int gblk_current;
+#endif
+
 /*
  * For the allocated request tables
  */
@@ -57,6 +73,12 @@ struct kmem_cache *request_cachep = NULL;
  * For queue allocation
  */
 struct kmem_cache *blk_requestq_cachep;
+
+/*
+ * [NHJ] : for epoch allocation 
+ */
+struct kmem_cache	*epoch_cachep;
+struct kmem_cache	*epoch_link_cachep;
 
 /*
  * Controlling structure to kblockd
@@ -713,6 +735,22 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 
 	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
 		goto fail;
+
+	/* [NHJ] UFS */
+	if (!q->epoch_pool)
+		q->epoch_pool = mempool_create_node (BLKDEV_MIN_RQ, mempool_alloc_slab,
+				mempool_free_slab, epoch_cachep, GFP_NOFS, q->node);
+	if (!q->epoch_pool) {
+		printk(KERN_ERR "epoch_pool create error\n");
+		return NULL;
+	}
+	if (!q->epoch_link_pool)
+		q->epoch_link_pool = mempool_create_node(BLKDEV_MIN_RQ, mempool_alloc_slab,
+				mempool_free_slab, epoch_link_cachep, GFP_NOFS, q->node);
+	if (!q->epoch_link_pool) {
+		printk(KERN_ERR "epoch_link_pool create error\n");
+		return NULL;
+	}
 
 	q->request_fn		= rfn;
 	q->prep_rq_fn		= NULL;
@@ -1423,6 +1461,19 @@ void blk_add_request_payload(struct request *rq, struct page *page,
 }
 EXPORT_SYMBOL_GPL(blk_add_request_payload);
 
+/*
+ * [NHJ] UFS : epoch merge function for bio
+ */
+static inline void bio_epoch_merge(struct request_queue *q, struct request *req,
+				struct bio *bio)
+{
+	if (bio->bi_rw & REQ_ORDERED) {
+		req->cmd_bflags |= REQ_ORDERED;
+		if (bio->bi_rw & REQ_BARRIER)
+			req->cmd_bflags |= REQ_BARRIER;
+	}
+}
+
 bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
 			    struct bio *bio)
 {
@@ -1435,6 +1486,9 @@ bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
 
 	if ((req->cmd_flags & REQ_FAILFAST_MASK) != ff)
 		blk_rq_set_mixed_merge(req);
+
+	/* [NHJ] : UFS */
+	bio_epoch_merge(q, req, bio);
 
 	req->biotail->bi_next = bio;
 	req->biotail = bio;
@@ -1457,6 +1511,9 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
 
 	if ((req->cmd_flags & REQ_FAILFAST_MASK) != ff)
 		blk_rq_set_mixed_merge(req);
+
+	/* [NHJ] : UFS */
+	bio_epoch_merge(q, req, bio);
 
 	bio->bi_next = req->bio;
 	req->bio = bio;
@@ -1538,6 +1595,11 @@ void init_request_from_bio(struct request *req, struct bio *bio)
 	if (bio->bi_rw & REQ_RAHEAD)
 		req->cmd_flags |= REQ_FAILFAST_MASK;
 
+	/* [NHJ] : UFS */
+	if (bio->bi_rw & REQ_ORDERED) {
+			req->cmd_bflags |= REQ_ORDERED;
+	}
+
 	req->errors = 0;
 	req->__sector = bio->bi_iter.bi_sector;
 	req->ioprio = bio_prio(bio);
@@ -1568,6 +1630,20 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 		spin_lock_irq(q->queue_lock);
 		where = ELEVATOR_INSERT_FLUSH;
 		goto get_rq;
+	}
+
+	/* [NHJ] UFS */
+	if (bio->bi_rw & REQ_ORDERED) {
+		if (!current->__epoch) {
+			blk_start_epoch(q);
+		}
+		get_epoch(current->__epoch);
+		bio->bi_epoch = current->__epoch;
+		bio->bi_epoch->pending++;
+
+		if (bio->bi_rw & REQ_BARRIER) {
+			blk_finish_epoch();
+		}
 	}
 
 	/*
@@ -1678,7 +1754,8 @@ static void handle_bad_sector(struct bio *bio)
 	char b[BDEVNAME_SIZE];
 
 	printk(KERN_INFO "attempt to access beyond end of device\n");
-	printk(KERN_INFO "%s: rw=%ld, want=%Lu, limit=%Lu\n",
+	/* [NHJ] UFS : rw=%ld -> rw=%lld */
+	printk(KERN_INFO "%s: rw=%lld, want=%Lu, limit=%Lu\n",
 			bdevname(bio->bi_bdev, b),
 			bio->bi_rw,
 			(unsigned long long)bio_end_sector(bio),
@@ -1927,9 +2004,11 @@ EXPORT_SYMBOL(generic_make_request);
  * interfaces; @bio must be presetup and ready for I/O.
  *
  */
-void submit_bio(int rw, struct bio *bio)
+void submit_bio(long long /*int*/ rw, struct bio *bio)
 {
 	bio->bi_rw |= rw;
+	
+	//bio->bi_rw &= ~(REQ_BARRIER | REQ_ORDERED);
 
 	/*
 	 * If it's a regular read/write or a barrier with data attached,
@@ -1951,7 +2030,128 @@ void submit_bio(int rw, struct bio *bio)
 		}
 
 		if (unlikely(block_dump)) {
-			char b[BDEVNAME_SIZE];
+				char b[BDEVNAME_SIZE];
+			printk(KERN_DEBUG "%s(%d): %s block %Lu on %s (%u sectors)\n",
+			current->comm, task_pid_nr(current),
+				(rw & WRITE) ? "WRITE" : "READ",
+				(unsigned long long)bio->bi_iter.bi_sector,
+				bdevname(bio->bi_bdev, b),
+				count);
+		}
+#ifdef CONFIG_MOST
+		/* [NHJ] : UFS confict most */
+		{
+			int tmp_file = 0;
+
+			if(bio && bio->bi_io_vec && bio->bi_io_vec->bv_page
+				&& bio->bio_io_vec->bv_page->mapping)
+			{
+				struct inode * inode;
+				//struct hlist_head *first;
+				struct hlist_node *next;
+				struct dentry *dentry;
+				//unsigned char *name;
+				int len;
+
+				inode = NULL;
+				next = NULL;
+				dentry = NULL;
+
+				if(bio->bi_io_vec->bv_page->mapping->host)
+					inode = bio->bi_io_vec->bv_page->mapping->host;
+
+				if(PageAnon( bio->bi_io_vec->bv_page))
+					goto final;
+
+				if(inode && inode->i_ino!=0 && inode->i_dentry.first->next)
+				{
+					next = inode->i_dentry.first->next;
+
+					dentry = hlist_entry(next, struct dentry, d_alias);
+
+					if(dentry)
+					{
+
+						len = strlen(dentry->d_iname);
+
+						strcpy(gblk_req_table[gblk_current].d_iname, dentry->d_iname);
+
+						if(rw & WRITE)
+						{
+							if(dentry->d_iname[len-8]=='-'
+								&& dentry->d_iname[len-7]=='j')	{
+								//printk("%s : (%s)(%s)\n", __func__, current->comm, dentry->d_iname);
+								tmp_file = 100000;
+							} else if(dentry->d_iname[len-12]=='b'
+								&& dentry->d_iname[len-11]=='-'
+								&& dentry->d_iname[len-10]=='m'
+								&& dentry->d_iname[len-9]=='j') {
+								//printk("%s : (%s)(%s)\n", __func__, current->comm, dentry->d_iname);
+								tmp_file = 200000;
+							} else if(dentry->d_iname[len-4]=='.'
+								&& dentry->d_iname[len-3]=='b'
+								&& dentry->d_iname[len-2]=='a'
+								&& dentry->d_iname[len-1]=='k') {
+								//printk("%s : (%s)(%s)\n", __func__, current->comm, dentry->d_iname);
+								tmp_file = 300000;
+							} else if(dentry->d_iname[len-3]=='t'
+								&& dentry->d_iname[len-2]=='m'
+								&& dentry->d_iname[len-1]=='p') {
+								//printk("%s : (%s)(%s)\n", __func__, current->comm, dentry->d_iname);
+								tmp_file = 400000;
+							} else if(dentry->d_iname[len-3]=='.'
+								&& dentry->d_iname[len-2]=='d'
+								&& dentry->d_iname[len-1]=='b') {
+								//printk("%s : (%s)(%s)\n", __func__, current->comm, dentry->d_iname);
+								tmp_file = 500000;
+							}
+						}
+					}
+				}
+
+				final:
+
+				gblk_req_table[gblk_current].pid = task_pid_nr(current);
+				gblk_req_table[gblk_current].temp_file = tmp_file
+				gblk_req_table[gblk_current].sector = bio->bi_sector;
+				gblk_req_table[gblk_current].count = count;
+
+				gblk_current++;
+
+				if(gblk_current ==  MOST_TABLE_SIZE)
+					gblk_current=0;
+
+ 			}
+		}
+#endif
+	}
+
+	generic_make_request(bio);
+}
+EXPORT_SYMBOL(submit_bio);
+
+/* [NHJ] UFS : submit_bio for commit procedure */
+void submit_bio64(long long rw, struct bio *bio)
+{
+	bio->bi_rw |= rw;
+
+	if (bio_has_data(bio)) {
+		unsigned int count;
+
+		if (unlikely(rw & REQ_WRITE_SAME))
+			count = bdev_logical_block_size(bio->bi_bdev) >> 9;
+		else
+			count = bio_sectors(bio);
+
+		if (rw & WRITE) {
+			count_vm_events(PGPGOUT, count);
+		} else {
+			task_io_account_read(bio->bi_iter.bi_size);
+			count_vm_events(PGPGIN, count);
+		}
+
+		if (unlikely(block_dump)) {
+			char b [BDEVNAME_SIZE];
 			printk(KERN_DEBUG "%s(%d): %s block %Lu on %s (%u sectors)\n",
 			current->comm, task_pid_nr(current),
 				(rw & WRITE) ? "WRITE" : "READ",
@@ -1960,10 +2160,10 @@ void submit_bio(int rw, struct bio *bio)
 				count);
 		}
 	}
-
 	generic_make_request(bio);
 }
-EXPORT_SYMBOL(submit_bio);
+EXPORT_SYMBOL(submit_bio64);
+
 
 /**
  * blk_rq_check_limits - Helper function to check a request for the queue limit
@@ -3162,6 +3362,140 @@ void blk_finish_plug(struct blk_plug *plug)
 }
 EXPORT_SYMBOL(blk_finish_plug);
 
+/* [NHJ] UFS : blk functions */
+void blk_issue_barrier_plug(struct blk_plug *plug)
+{
+	if(current->__epoch)
+		blk_finish_epoch();
+	else
+		current->barrier_fail = 1;
+}
+EXPORT_SYMBOL(blk_issue_barrier_plug);
+
+/* [NHJ] UFS */
+void blk_request_dispatched(struct request *req)
+{
+	struct bio *req_bio;
+
+	if (req->cmd_type != REQ_TYPE_FS)
+		return;
+
+	if (!req->__data_len)
+		return;
+
+	req_bio = req->bio;
+
+	while (req_bio) {
+		int i;
+		struct bio *bio = req_bio;
+
+		if (req->cmd_bflags & REQ_ORDERED) {
+			if (bio->bi_epoch) {
+				struct epoch *epoch;
+				epoch = bio->bi_epoch;
+				epoch->complete++;
+				put_epoch(epoch);
+				if (atomic_read(&epoch->e_count) == 0)
+					mempool_free(epoch, epoch->q->epoch_pool);
+			}
+		}
+
+		for (i=0; i < bio->bi_vcnt; i++) {
+			struct bio_vec *bvec = &bio->bi_io_vec[i];
+			struct page *page = bvec->bv_page;
+			if (page) {
+				//end_page_dispatch(page);
+			}
+		}
+
+		if (dispatch_bio_bh(bio)) {
+			req_bio = bio->bi_next;
+			continue;
+		}
+
+		req_bio = bio->bi_next;
+	}
+}
+EXPORT_SYMBOL(blk_request_dispatched);
+
+void blk_start_new_epoch(struct request_queue *q)
+{       
+        struct epoch *epoch = current->epoch;
+        if (!epoch) { 
+	        epoch = mempool_alloc(q->epoch_pool, GFP_NOFS);
+	} else if (epoch->pending != 0) {
+                epoch->barrier = 1;             
+                epoch = mempool_alloc(q->epoch_pool, GFP_NOFS); 
+        } else if (epoch->pending == 0  && epoch->dispatch == epoch->complete) {
+        } else  
+                epoch = mempool_alloc(q->epoch_pool, GFP_NOFS);
+														        
+        epoch->task = current;
+        epoch->q = q;
+        epoch->barrier = 0;
+        epoch->pending = 0;
+        epoch->dispatch = 0;
+        epoch->complete = 0;
+        epoch->error = 0;
+        epoch->error_flags = 0;
+														        
+        current->epoch = epoch;
+}
+EXPORT_SYMBOL(blk_start_new_epoch);
+
+void blk_start_epoch(struct request_queue *q)
+{
+        struct epoch *epoch = current->__epoch;
+        if (epoch) {
+	        printk(KERN_ERR "UFS: %s: unfinished epoch!\n", __func__);
+	        return;
+        }
+
+        epoch = mempool_alloc(q->epoch_pool, GFP_NOFS);
+
+        if (!epoch) {
+	        printk(KERN_ERR "UFS: %s: epoch alloc failed!\n", __func__);
+        	return;
+        }
+        memset(epoch, 0, sizeof(struct epoch));
+        epoch->task = current;
+        epoch->q = q;
+
+        epoch->barrier = 0;
+        epoch->pending = 0;
+        epoch->dispatch = 0;
+        epoch->complete = 0;
+        epoch->error = 0;
+        epoch->error_flags = 0;
+
+        get_epoch(epoch);
+
+        current->__epoch = epoch;
+}
+
+
+
+void blk_finish_epoch(void)
+{
+	struct epoch *epoch = current->__epoch;
+
+	if (!epoch) {
+		printk(KERN_ERR "UFS: %s: unstarted epoch!\n", __func__);
+		return;
+	}
+	if (epoch->pending == 0) {
+		epoch->task->barrier_fail = 1;
+	} else {
+		epoch->barrier = 1;
+	}
+
+	current->__epoch = 0;
+	put_epoch(epoch);
+	if (atomic_read(&epoch->e_count) == 0)
+		mempool_free(epoch, epoch->q->epoch_pool);
+}
+EXPORT_SYMBOL(blk_finish_epoch);
+
 #ifdef CONFIG_PM_RUNTIME
 /**
  * blk_pm_runtime_init - Block layer runtime PM initialization routine
@@ -3321,6 +3655,12 @@ int __init blk_dev_init(void)
 
 	blk_requestq_cachep = kmem_cache_create("blkdev_queue",
 			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
+
+	/* [NHJ] UFS : epoch slab init */
+	epoch_cachep = kmem_cache_create("blkdev_epoch",
+			sizeof(struct epoch), 0, SLAB_PANIC, NULL);
+	epoch_link_cachep = kmem_cache_create("blkdev_epoch_link",
+			sizeof(struct epoch_link), 0, SLAB_PANIC, NULL);
 
 	return 0;
 }

@@ -473,6 +473,16 @@ static void blk_account_io_merge(struct request *req)
 	}
 }
 
+/* [NHJ] UFS: request merge */
+void request_epoch_merge(struct request_queue *q, struct request *req, struct request *next)
+{
+       if (next->cmd_bflags & REQ_ORDERED) {
+               req->cmd_bflags |= REQ_ORDERED;
+               if (next->cmd_bflags & REQ_BARRIER)
+                       req->cmd_bflags |= REQ_BARRIER;
+       }
+}
+
 /*
  * Has to be called with the request spinlock acquired
  */
@@ -530,6 +540,9 @@ static int attempt_merge(struct request_queue *q, struct request *req,
 	 */
 	if (time_after(req->start_time, next->start_time))
 		req->start_time = next->start_time;
+
+	/* [NHJ] UFS */
+	request_epoch_merge(q, req, next);
 
 	req->biotail->bi_next = next->bio;
 	req->biotail = next->biotail;

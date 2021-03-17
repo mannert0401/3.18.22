@@ -87,6 +87,7 @@ EXPORT_SYMBOL(jbd2_journal_ack_err);
 EXPORT_SYMBOL(jbd2_journal_clear_err);
 EXPORT_SYMBOL(jbd2_log_wait_commit);
 EXPORT_SYMBOL(jbd2_log_start_commit);
+EXPORT_SYMBOL(jbd2_log_flush_commit);
 EXPORT_SYMBOL(jbd2_journal_start_commit);
 EXPORT_SYMBOL(jbd2_journal_force_commit_nested);
 EXPORT_SYMBOL(jbd2_journal_wipe);
@@ -191,6 +192,13 @@ static int kjournald2(void *arg)
 	journal_t *journal = arg;
 	transaction_t *transaction;
 
+        /*
+	 * int commit_iter = 1;
+	 * int cpsetup_iter = 1;
+	 * int commit = 0;
+	 * int cpsetup = 0;        
+	 */
+
 	/*
 	 * Set up an interval timer which can be used to trigger a commit wakeup
 	 * after the commit interval expires
@@ -220,7 +228,9 @@ loop:
 		jbd_debug(1, "OK, requests differ\n");
 		write_unlock(&journal->j_state_lock);
 		del_timer_sync(&journal->j_commit_timer);
-		jbd2_journal_commit_transaction(journal);
+		/* [NHJ] UFS */
+		jbd2_journal_barrier_commit_transaction(journal);
+		wake_up(&journal->j_wait_commit);
 		write_lock(&journal->j_state_lock);
 		goto loop;
 	}
@@ -283,6 +293,61 @@ end_loop:
 	return 0;
 }
 
+
+/*
+ * UFS: kjounrald2cp: kernel thread which is executed when I/O compelte.
+ */
+ 
+static int kjournald2cp(void *arg)
+{
+        journal_t *journal = arg;
+ 
+        set_freezable();
+ 
+        journal->j_cptask = current;
+        wake_up(&journal->j_wait_done_cpsetup);
+        
+loop:
+        if (journal->j_flags & JBD2_UNMOUNT)
+                goto end_loop;
+ 
+        spin_lock(&journal->j_cplist_lock);
+        if (journal->j_cpsetup_transactions) {    
+                spin_unlock(&journal->j_cplist_lock);
+                jbd2_journal_cpsetup_transaction(journal);
+                goto loop;
+        }
+        spin_unlock(&journal->j_cplist_lock);
+ 
+        if (freezing(current)) {
+                try_to_freeze();
+        } else {
+                DEFINE_WAIT(wait);
+                int should_sleep = 1;
+ 
+                prepare_to_wait(&journal->j_wait_cpsetup, &wait,
+                                TASK_INTERRUPTIBLE);
+                if (journal->j_cpsetup_transactions)
+                        should_sleep = 0;
+                if (should_sleep) {
+                        schedule();
+                }
+                finish_wait(&journal->j_wait_cpsetup, &wait);
+        }
+ 
+        goto loop;
+ 
+end_loop:
+        journal->j_cptask = NULL;
+        wake_up(&journal->j_wait_done_cpsetup);
+        return 0;
+} 
+
+
+
+
+
+
 static int jbd2_journal_start_thread(journal_t *journal)
 {
 	struct task_struct *t;
@@ -308,6 +373,35 @@ static void journal_kill_thread(journal_t *journal)
 		write_lock(&journal->j_state_lock);
 	}
 	write_unlock(&journal->j_state_lock);
+}
+
+ /*
+  * [NHJ] UFS : checkpoint list setup thread
+  */
+static int jbd2_journal_start_cpthread(journal_t * journal)
+{
+        struct task_struct *t;
+ 
+        t = kthread_run(kjournald2cp, journal, "jbd2cp/%s",
+                        journal->j_devname);
+        if (IS_ERR(t))
+                return PTR_ERR(t);
+ 
+        wait_event(journal->j_wait_done_cpsetup, journal->j_cptask != NULL);
+        return 0;
+}
+static void journal_kill_cpthread(journal_t *journal)
+{
+        write_lock(&journal->j_state_lock);
+        journal->j_flags |= JBD2_UNMOUNT;
+ 
+        while (journal->j_cptask) {
+                wake_up(&journal->j_wait_cpsetup);
+                write_unlock(&journal->j_state_lock);
+                wait_event(journal->j_wait_done_cpsetup, journal->j_cptask == NULL);
+                write_lock(&journal->j_state_lock);
+        }
+        write_unlock(&journal->j_state_lock);
 }
 
 /*
@@ -344,7 +438,7 @@ static void journal_kill_thread(journal_t *journal)
  * Bit 0 set == escape performed on the data
  * Bit 1 set == buffer copy-out performed (kfree the data after IO)
  */
-
+extern unsigned int jbd2_psp_mode;
 int jbd2_journal_write_metadata_buffer(transaction_t *transaction,
 				  struct journal_head  *jh_in,
 				  struct buffer_head **bh_out,
@@ -420,13 +514,41 @@ repeat:
 		do_escape = 1;
 	}
 	kunmap_atomic(mapped_data);
-
+#ifdef PROACTIVE_SHADOWING_PAGE
+#ifdef INODE_FORCE_SHADOWING
+	jh_in->b_hot |= bh_in->isinode;
+#endif
+        if (!jh_in->b_frozen_data && (jh_in->b_hot & jbd2_psp_mode)) {
+                need_copy_out = 1;
+	}
+#endif
 	/*
 	 * Do we need to do a data copy?
 	 */
+#ifdef ENTIRE_FORCE_SHADOWING
+        if ((need_copy_out || (ENTIRE_FORCE_SHADOWING & jbd2_psp_mode))
+                        && !done_copy_out) {
+#else
 	if (need_copy_out && !done_copy_out) {
+#endif
 		char *tmp;
 
+#ifdef SHADOW_PAGE_POOL
+                if ((jbd2_psp_mode & SHADOW_PAGE_POOL) && !list_empty(journal->j_shadow_head_pool)) {
+                        struct list_head * new = journal->j_shadow_head_pool->next;
+                        jh_in->f_shadow_head = list_entry(new, struct shadow_head, b_sh_pool_list);
+                        list_del(new);
+                        tmp = jh_in->f_shadow_head->b_frozen;
+                } else {
+                        jbd_unlock_bh_state(bh_in);     
+                        tmp = jbd2_alloc(bh_in->b_size, GFP_NOFS);
+                        if (!tmp) {
+                                brelse(new_bh);
+                                return -ENOMEM;
+                        }
+                        jbd_lock_bh_state(bh_in);
+                }
+#else
 		jbd_unlock_bh_state(bh_in);
 		tmp = jbd2_alloc(bh_in->b_size, GFP_NOFS);
 		if (!tmp) {
@@ -434,8 +556,19 @@ repeat:
 			return -ENOMEM;
 		}
 		jbd_lock_bh_state(bh_in);
+#endif
 		if (jh_in->b_frozen_data) {
+#ifdef SHADOW_PAGE_POOL
+                         if ((jbd2_psp_mode & SHADOW_PAGE_POOL) && (jh_in->f_shadow_head)) {
+                                 list_add_tail(&jh_in->f_shadow_head->b_sh_pool_list, journal->j_shadow_head_pool);
+                                 jh_in->f_shadow_head = NULL;
+                                 journal->j_shadow_pool_count--;
+                         } else {
+                                 jbd2_free(tmp, bh_in->b_size);
+                         } 
+#else
 			jbd2_free(tmp, bh_in->b_size);
+#endif
 			goto repeat;
 		}
 
@@ -454,6 +587,9 @@ repeat:
 		 * b_frozen_data usage.
 		 */
 		jh_in->b_frozen_triggers = jh_in->b_triggers;
+#ifdef PROACTIVE_SHADOWING_PAGE
+                jh_in->b_hot = 0;
+#endif  
 	}
 
 	/*
@@ -547,6 +683,56 @@ int jbd2_log_start_commit(journal_t *journal, tid_t tid)
 	return ret;
 }
 
+/* [NHJ] UFS */ 
+int __jbd2_log_flush_commit(journal_t *journal, tid_t target)
+{
+        /* Return if the txn has already requested to be committed */
+        if (journal->j_commit_request == target)
+                return 0;
+ 
+        /*
+         * The only transaction we can possibly wait upon is the
+         * currently running transaction (if it exists).  Otherwise,
+         * the target tid must be an old one.
+         */
+        if (journal->j_running_transaction &&
+            journal->j_running_transaction->t_tid == target) {
+                /*
+                 * We want a new commit: OK, mark the request and wakeup the
+                 * commit thread.  We do _not_ do the commit ourselves.
+                 */
+ 
+                journal->j_commit_request = target;
+                journal->j_running_transaction->t_flush_trigger = 1;
+                jbd_debug(1, "JBD2: requesting commit %d/%d\n",
+                          journal->j_commit_request,
+                          journal->j_commit_sequence);
+                journal->j_running_transaction->t_requested = jiffies;
+                wake_up(&journal->j_wait_commit);
+                return 1;
+        } else if (!tid_geq(journal->j_commit_request, target))
+                /* This should never happen, but if it does, preserve
+                   the evidence before kjournald goes into a loop and
+                   increments j_commit_sequence beyond all recognition. */
+                WARN_ONCE(1, "JBD2: bad log_start_commit: %u %u %u %u\n",
+                          journal->j_commit_request,
+                          journal->j_commit_sequence,
+                          target, journal->j_running_transaction ? 
+                          journal->j_running_transaction->t_tid : 0);
+        return 0;
+}
+ 
+int jbd2_log_flush_commit(journal_t *journal, tid_t tid)
+{
+        int ret;
+        write_lock(&journal->j_state_lock);
+        ret = __jbd2_log_flush_commit(journal, tid);
+        write_unlock(&journal->j_state_lock);
+        return ret;
+}
+ 
+
+
 /*
  * Force and wait any uncommitted transactions.  We can only force the running
  * transaction if we don't have an active handle, otherwise, we will deadlock.
@@ -577,7 +763,7 @@ static int __jbd2_journal_force_commit(journal_t *journal)
 	read_unlock(&journal->j_state_lock);
 	if (need_to_start)
 		jbd2_log_start_commit(journal, tid);
-	ret = jbd2_log_wait_commit(journal, tid);
+	ret = jbd2_log_wait_cpsetup(journal, tid);
 	if (!ret)
 		ret = 1;
 
@@ -667,6 +853,10 @@ int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid)
 	/* Transaction already committed? */
 	if (tid_geq(journal->j_commit_sequence, tid))
 		goto out;
+
+	ret = 1;
+	goto out;
+
 	commit_trans = journal->j_committing_transaction;
 	if (!commit_trans || commit_trans->t_tid != tid) {
 		ret = 1;
@@ -700,13 +890,6 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 	int err = 0;
 
 	read_lock(&journal->j_state_lock);
-#ifdef CONFIG_JBD2_DEBUG
-	if (!tid_geq(journal->j_commit_request, tid)) {
-		printk(KERN_ERR
-		       "%s: error: j_commit_request=%d, tid=%d\n",
-		       __func__, journal->j_commit_request, tid);
-	}
-#endif
 	while (tid_gt(tid, journal->j_commit_sequence)) {
 		jbd_debug(1, "JBD2: want %d, j_commit_sequence=%d\n",
 				  tid, journal->j_commit_sequence);
@@ -723,6 +906,32 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 	return err;
 }
 
+/* UFS */
+int jbd2_log_wait_cpsetup(journal_t *journal, tid_t tid)
+{
+        int err = 0;
+ 
+        read_lock(&journal->j_state_lock);
+ 
+        while (tid_gt(tid, journal->j_cpsetup_sequence)) {
+                jbd_debug(1, "JBD2: want %d, j_cpsetup_sequence=%d\n",
+                                  tid, journal->j_cpsetup_sequence);
+                wake_up(&journal->j_wait_cpsetup);
+                read_unlock(&journal->j_state_lock);
+                wait_event(journal->j_wait_done_cpsetup,
+                                !tid_gt(tid, journal->j_cpsetup_sequence));
+                read_lock(&journal->j_state_lock);
+        }
+        read_unlock(&journal->j_state_lock);
+ 
+        if (unlikely(is_journal_aborted(journal))) {
+                printk(KERN_EMERG "journal commit I/O error\n");
+                err = -EIO;
+        }
+        return err;
+}
+EXPORT_SYMBOL(jbd2_log_wait_cpsetup);
+ 
 /*
  * When this function returns the transaction corresponding to tid
  * will be completed.  If the transaction has currently running, start
@@ -754,6 +963,88 @@ wait_commit:
 }
 EXPORT_SYMBOL(jbd2_complete_transaction);
 
+/*[NHJ] UFS */
+int jbd2_complete_cpsetup_transaction(journal_t *journal, tid_t tid)
+{
+        int need_to_wait = 1;  
+        int ret = 0;
+ 
+        ret = jbd2_flush_transaction(journal, tid);
+        if (!ret) {
+                read_lock(&journal->j_state_lock);
+                if (tid_geq(journal->j_cpsetup_sequence, tid))
+                        need_to_wait = 0;
+                else
+                        wake_up(&journal->j_wait_cpsetup);
+                read_unlock(&journal->j_state_lock);
+        }
+ 
+        if (!need_to_wait)
+                return 0;
+ 
+        return jbd2_log_wait_cpsetup(journal, tid);
+ }
+EXPORT_SYMBOL(jbd2_complete_cpsetup_transaction);
+
+int jbd2_flush_transaction(journal_t *journal, tid_t tid)
+{
+        int need_to_wait = 1;
+/*
+#if (defined(TRY_COMMIT) && \
+                defined(JBD2_BARRIER_CONFLICT_COUNT) && \
+                defined(DELAY_ON_COMMIT_WITH_LOOP))
+        transaction_t *running_transaction = journal->j_running_transaction;
+try_commit:
+#endif
+*/
+ 
+        read_lock(&journal->j_state_lock);
+        if (journal->j_running_transaction &&
+                journal->j_running_transaction->t_tid == tid) {
+                if (journal->j_commit_request != tid) {
+ 
+/*
+#if (defined(TRY_COMMIT) && \
+                defined(JBD2_BARRIER_CONFLICT_COUNT) && \
+                defined(DELAY_ON_COMMIT_WITH_LOOP))
+                        if ((jbd2_psp_mode & TRY_COMMIT) &&
+                                (jbd2_psp_mode & JBD2_BARRIER_CONFLICT_COUNT) &&
++                               (jbd2_psp_mode & DELAY_ON_COMMIT_WITH_LOOP)) {
+ 
+                  //             printk("[%s] t_conflict_count : %d\n",
+                                //                      __func__,
+                                //                       atomic_read(&running_transaction->t_conflict_count));
+ 
+                                if (atomic_read(&running_transaction->t_conflict_count)) {
+                                        J_ASSERT(0 <= atomic_read(&running_transaction->t_conflict_count));
+                                        read_unlock(&journal->j_state_lock);
+                                        wake_up(&journal->j_wait_cpsetup);
+                                        wait_event(journal->j_wait_done_cpsetup,
+                                                                !atomic_read(&running_transaction->t_conflict_count));
+                                        goto try_commit;
+                                }
+                        }
+#endif
+*/
+                        /* transaction not yet started, so request it */
+                        read_unlock(&journal->j_state_lock);
+                        jbd2_log_flush_commit(journal, tid);
+                        goto wait_commit;
+                }
+        } else if (!(journal->j_committing_transaction && 
+                        journal->j_committing_transaction->t_tid == tid)) {
+                need_to_wait = 0;
+        }
+        read_unlock(&journal->j_state_lock);
+ 
+        if (!need_to_wait)
+                return 0;
+ 
+wait_commit:
+        return 0;
+}
+EXPORT_SYMBOL(jbd2_flush_transaction);
+ 
 /*
  * Log buffer allocation routines:
  */
@@ -898,7 +1189,8 @@ int __jbd2_update_log_tail(journal_t *journal, tid_t tid, unsigned long block)
 	 * space and if we lose sb update during power failure we'd replay
 	 * old transaction with possibly newly overwritten data.
 	 */
-	ret = jbd2_journal_update_sb_log_tail(journal, tid, block, WRITE_FUA);
+	//ret = jbd2_journal_update_sb_log_tail(journal, tid, block, WRITE_FUA);
+	ret = jbd2_journal_update_sb_log_tail(journal, tid, block, WRITE_BARRIER/*WRITE_FUA*/);
 	if (ret)
 		goto out;
 
@@ -1017,6 +1309,9 @@ static int jbd2_seq_info_open(struct inode *inode, struct file *file)
 	}
 	spin_lock(&journal->j_history_lock);
 	memcpy(s->stats, &journal->j_stats, size);
+#ifdef INITIALIZE_INFO
+        memset(&journal->j_stats, 0, size);     
+#endif
 	s->journal = journal;
 	spin_unlock(&journal->j_history_lock);
 
@@ -1041,6 +1336,98 @@ static int jbd2_seq_info_release(struct inode *inode, struct file *file)
 	return seq_release(inode, file);
 }
 
+#ifdef PAGE_CONFLICT_PROFILE
+/* page conflict profile */
+static int jbd2_pcl_show(struct seq_file *seq, void *v)
+{
+        journal_t *journal = seq->private;
+        struct conf_node *iter;
+
+        for (iter = journal->pcl;iter != NULL;iter = iter->next) {
+    	    seq_printf(seq,"%u %u %u\n",iter->b_blocknr, iter->count, iter->wait);
+            iter->count = 0;
+            iter->wait = 0;
+        }
+        return 0;
+}
+
+static int jbd2_pcl_release(struct inode *inode, struct file *file)
+{
+	return single_release(inode,file);
+}
+
+static int jbd2_pcl_open(struct inode *inode, struct file *file)
+{
+	return single_open(file,jbd2_pcl_show,PDE_DATA(inode));
+}
+
+static const struct file_operations jbd2_pcl_fops = {
+       .owner          = THIS_MODULE,
+       .open           = jbd2_pcl_open,
+       .read           = seq_read,
+       .llseek         = seq_lseek,
+       .release        = jbd2_pcl_release,
+};
+#endif
+
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+/*
+ * It prints only 100 entries.
+ * So if you want to all entries, you have to read the file
+ * until its contents is "NULL".
+ * - Joontaek Oh.
+ */
+static int jbd2_committing_show(struct seq_file *seq, void *v)
+{
+        int i = 0;
+        journal_t *journal = seq->private;
+        struct committing_node *cur, *tmp;
+ 
+        if (!journal->j_committing_tx_list) {
+                seq_printf(seq, "NULL\n");
+                return 0;
+        }
+ 
+        list_for_each_entry_safe(cur, tmp, &journal->j_committing_tx_list->node_list, node_list) {
+                if (100 < i) {
+                        journal->j_committing_tx_list = cur;
+                        return 0;
+                }
+                i++;
+                seq_printf(seq, "%d %d %d %d\n",
+                                cur->committing_count, cur->count, cur->conflict_count_max, cur->conflict_count_min);
+                 list_del_init(&cur->node_list);
+                journal->j_committing_list_count -= cur->count;
+                 kfree(cur);
+                journal->j_committing_node_count--;
+         }
+ 
+        journal->j_committing_tx_list = NULL;
+        journal->j_committing_list_count = 0;
+        journal->j_committing_node_count = 0;
+ 
+        return 0;
+}
+
+static int jbd2_committing_release(struct inode *inode, struct file *file)
+{
+        return single_release(inode,file);
+}
+ 
+static int jbd2_committing_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, jbd2_committing_show,PDE_DATA(inode));
+}
+
+static const struct file_operations jbd2_committing_fops = {
+        .owner          = THIS_MODULE,
+        .open           = jbd2_committing_open,
+        .read           = seq_read,
+        .llseek         = seq_lseek,
+        .release        = jbd2_committing_release,
+};
+#endif
+
 static const struct file_operations jbd2_seq_info_fops = {
 	.owner		= THIS_MODULE,
 	.open           = jbd2_seq_info_open,
@@ -1057,12 +1444,26 @@ static void jbd2_stats_proc_init(journal_t *journal)
 	if (journal->j_proc_entry) {
 		proc_create_data("info", S_IRUGO, journal->j_proc_entry,
 				 &jbd2_seq_info_fops, journal);
+#ifdef PAGE_CONFLICT_PROFILE
+                proc_create_data("pcl", S_IRUGO, journal->j_proc_entry,
+		                                 &jbd2_pcl_fops, journal);
+#endif
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+                proc_create_data("committing_tx", S_IRUGO, journal->j_proc_entry,
+                                  &jbd2_committing_fops, journal);
+#endif
 	}
 }
 
 static void jbd2_stats_proc_exit(journal_t *journal)
 {
 	remove_proc_entry("info", journal->j_proc_entry);
+#ifdef PAGE_CONFLICT_PROFILE
+        remove_proc_entry("pcl", journal->j_proc_entry);
+#endif
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+        remove_proc_entry("committing_tx", journal->j_proc_entry);
+#endif
 	remove_proc_entry(journal->j_devname, proc_jbd2_stats);
 }
 
@@ -1078,6 +1479,11 @@ static void jbd2_stats_proc_exit(journal_t *journal)
 static journal_t * journal_init_common (void)
 {
 	journal_t *journal;
+#ifdef SHADOW_PAGE_POOL
+        void * temp;
+        int pool_count;
+        struct shadow_head * pool_head;
+#endif	
 	int err;
 
 	journal = kzalloc(sizeof(*journal), GFP_KERNEL);
@@ -1089,15 +1495,32 @@ static journal_t * journal_init_common (void)
 	init_waitqueue_head(&journal->j_wait_commit);
 	init_waitqueue_head(&journal->j_wait_updates);
 	init_waitqueue_head(&journal->j_wait_reserved);
+
+        /* [NHJ] UFS */
+        init_waitqueue_head(&journal->j_wait_cpsetup);
+        init_waitqueue_head(&journal->j_wait_done_cpsetup);
+        spin_lock_init(&journal->j_cplist_lock);
+
+#ifdef JBD2_BARRIER_COMMITTING_TX
+        atomic_set(&journal->j_committing_transactions, 0);
+//      journal->j_committing_list_count = 0;
+//      journal->j_committing_node_count = 0;
+#endif
+
 	mutex_init(&journal->j_barrier);
 	mutex_init(&journal->j_checkpoint_mutex);
 	spin_lock_init(&journal->j_revoke_lock);
 	spin_lock_init(&journal->j_list_lock);
 	rwlock_init(&journal->j_state_lock);
 
+#ifdef PAGE_CONFLICT_PROFILE
+        spin_lock_init(&journal->j_pcl_lock);
+#endif
+
 	journal->j_commit_interval = (HZ * JBD2_DEFAULT_MAX_COMMIT_AGE);
 	journal->j_min_batch_time = 0;
 	journal->j_max_batch_time = 15000; /* 15ms */
+
 	atomic_set(&journal->j_reserved_credits, 0);
 
 	/* The journal is marked for error until we succeed with recovery! */
@@ -1111,6 +1534,31 @@ static journal_t * journal_init_common (void)
 	}
 
 	spin_lock_init(&journal->j_history_lock);
+
+#ifdef SHADOW_PAGE_POOL
+        printk("[%s] start make page pool!\n", __func__);
+        temp =  kzalloc(4096 * 64,GFP_KERNEL);
+
+        journal->j_shadow_head_pool = kzalloc(sizeof(struct list_head), GFP_KERNEL);
+        journal->j_full_shadow_pool = kzalloc(sizeof(struct list_head), GFP_KERNEL);
+
+        J_ASSERT(journal->j_shadow_head_pool && journal->j_full_shadow_pool);
+
+        INIT_LIST_HEAD(journal->j_full_shadow_pool);
+	INIT_LIST_HEAD(journal->j_shadow_head_pool);
+        journal->j_shadow_pool_count=0;
+
+        for (pool_count=0; pool_count < 64; pool_count++) {
+                pool_head  =  kzalloc(sizeof(struct shadow_head), GFP_KERNEL);
+                J_ASSERT(pool_head);
+                pool_head->journal = journal;
+                pool_head->b_frozen = temp + pool_count * 4096;
+                J_ASSERT(pool_head->b_frozen);
+                list_add_tail(&pool_head->b_sh_full_list, journal->j_full_shadow_pool);
+                list_add_tail(&pool_head->b_sh_pool_list, journal->j_shadow_head_pool);
+        }
+#endif
+        printk("[%s] end journal init!\n" ,__func__);
 
 	return journal;
 }
@@ -1286,6 +1734,8 @@ static int journal_reset(journal_t *journal)
 	journal_superblock_t *sb = journal->j_superblock;
 	unsigned long long first, last;
 
+	int ret;	/* [NHJ] UFS */
+
 	first = be32_to_cpu(sb->s_first);
 	last = be32_to_cpu(sb->s_maxlen);
 	if (first + JBD2_MIN_JOURNAL_BLOCKS > last + 1) {
@@ -1306,6 +1756,10 @@ static int journal_reset(journal_t *journal)
 	journal->j_commit_sequence = journal->j_transaction_sequence - 1;
 	journal->j_commit_request = journal->j_commit_sequence;
 
+        /* [NHJ] UFS */
+        journal->j_cpsetup_request = journal->j_commit_sequence;
+        journal->j_cpsetup_sequence = journal->j_commit_sequence - 1;
+ 
 	journal->j_max_transaction_buffers = journal->j_maxlen / 4;
 
 	/*
@@ -1335,18 +1789,37 @@ static int journal_reset(journal_t *journal)
 						WRITE_FUA);
 		mutex_unlock(&journal->j_checkpoint_mutex);
 	}
-	return jbd2_journal_start_thread(journal);
+        ret = jbd2_journal_start_thread(journal);
+        /* [NHJ] UFS */
+        if (!ret) {
+                jbd2_journal_start_cpthread(journal);
+                printk(KERN_INFO "jbd2_journal_start_cpthread complete\n");
+        }
+        return ret;
 }
 
-static int jbd2_write_superblock(journal_t *journal, int write_op)
+/* UFS */
+static int jbd2_write_superblock(journal_t *journal, long long write_op)
 {
 	struct buffer_head *bh = journal->j_sb_buffer;
 	journal_superblock_t *sb = journal->j_superblock;
 	int ret;
 
 	trace_jbd2_write_superblock(journal, write_op);
+
 	if (!(journal->j_flags & JBD2_BARRIER))
 		write_op &= ~(REQ_FUA | REQ_FLUSH);
+	
+        /* UFS */
+        write_op |= REQ_ORDERED;
+        if (write_op & REQ_FUA) {
+                write_op &= ~REQ_FUA;
+                write_op |= (REQ_ORDERED | REQ_BARRIER);
+        }
+        if (write_op & REQ_FLUSH) {
+                write_op &= ~REQ_FLUSH;   
+        }
+
 	lock_buffer(bh);
 	if (buffer_write_io_error(bh)) {
 		/*
@@ -1366,7 +1839,13 @@ static int jbd2_write_superblock(journal_t *journal, int write_op)
 	jbd2_superblock_csum_set(journal, sb);
 	get_bh(bh);
 	bh->b_end_io = end_buffer_write_sync;
-	ret = submit_bh(write_op, bh);
+        ret = submit_bh64(write_op, bh);
+ 
+        /* UFS */
+        if (write_op & REQ_ORDERED) {
+                wait_on_buffer_dispatch(bh);
+                return ret;
+        }
 	wait_on_buffer(bh);
 	if (buffer_write_io_error(bh)) {
 		clear_buffer_write_io_error(bh);
@@ -1393,8 +1872,9 @@ static int jbd2_write_superblock(journal_t *journal, int write_op)
  * Update a journal's superblock information about log tail and write it to
  * disk, waiting for the IO to complete.
  */
+/* [NHJ] UFS */
 int jbd2_journal_update_sb_log_tail(journal_t *journal, tid_t tail_tid,
-				     unsigned long tail_block, int write_op)
+				     unsigned long tail_block, long long write_op)
 {
 	journal_superblock_t *sb = journal->j_superblock;
 	int ret;
@@ -1693,9 +2173,16 @@ recovery_error:
 int jbd2_journal_destroy(journal_t *journal)
 {
 	int err = 0;
+#ifdef SHADOW_PAGE_POOL
+         struct list_head * item = NULL;
+         struct shadow_head * sh = NULL;
+#endif
 
 	/* Wait for the commit thread to wake up and die. */
 	journal_kill_thread(journal);
+
+        /* UFS */
+        journal_kill_cpthread(journal);
 
 	/* Force a final log commit */
 	if (journal->j_running_transaction)
@@ -1736,6 +2223,52 @@ int jbd2_journal_destroy(journal_t *journal)
 		jbd2_journal_destroy_revoke(journal);
 	if (journal->j_chksum_driver)
 		crypto_free_shash(journal->j_chksum_driver);
+
+#ifdef SHADOW_PAGE_POOL    
+        J_ASSERT(journal->j_shadow_head_pool);
+        J_ASSERT(journal->j_full_shadow_pool);
+        printk("\n[%s]start destroy j_shadow_pool", __func__);
+        item = journal->j_full_shadow_pool->next;
+        printk("\n[%s]start2 destroy j_shadow_pool", __func__);
+
+        sh = list_entry(item, struct shadow_head, b_sh_full_list);
+        J_ASSERT(sh);
+        printk("\n[%s]free data address : %p", __func__, sh->b_frozen);
+        J_ASSERT(sh->b_frozen);
+        kfree(sh->b_frozen);
+        printk("\n[%s]freed data address : %p", __func__, sh->b_frozen);
+ 
+        sh = NULL;
+ 
+        list_for_each (item, journal->j_full_shadow_pool) {
+                if (sh != NULL) {
+                    J_ASSERT(sh);
+                        list_del(&sh->b_sh_full_list);
+                        kfree(sh);
+                }
+                sh = list_entry(item, struct shadow_head, b_sh_full_list);
+        }
+          if (sh != NULL) {
+            J_ASSERT(sh);
+            list_del(&sh->b_sh_full_list);
+            kfree(sh);
+        }
+	J_ASSERT(list_empty(journal->j_full_shadow_pool));
+        printk("\n[%s]j_shadow_haed_pool address : %p", __func__, journal->j_shadow_head_pool);
+        printk("\n[%s]j_full_shadow_pool address : %p", __func__, journal->j_full_shadow_pool);
+        kfree(journal->j_shadow_head_pool);
+        kfree(journal->j_full_shadow_pool);
+        printk("\n[%s]freed j_shadow_haed_pool address : %p", __func__, journal->j_shadow_head_pool);
+        printk("\n[%s]freed j_full_shadow_pool address : %p", __func__, journal->j_full_shadow_pool);
+#endif
+
+#ifdef PAGE_CONFLICT_PROFILE
+	/* page conflict profile */
+	free_pcl(journal->pcl);
+#endif
+#ifdef _JBD2_BARRIER_COMMITTING_TX
+        free_committing_node_list(journal);
+#endif
 	kfree(journal->j_wbuf);
 	kfree(journal);
 
@@ -2451,8 +2984,11 @@ struct journal_head *jbd2_journal_add_journal_head(struct buffer_head *bh)
 	struct journal_head *new_jh = NULL;
 
 repeat:
-	if (!buffer_jbd(bh))
+	if (!buffer_jbd(bh)) {
 		new_jh = journal_alloc_journal_head();
+                memset(new_jh, 0, sizeof(*new_jh));
+                INIT_LIST_HEAD(&new_jh->b_jh_wait_list);
+	}
 
 	jbd_lock_bh_journal_head(bh);
 	if (buffer_jbd(bh)) {
@@ -2477,6 +3013,9 @@ repeat:
 	}
 	jh->b_jcount++;
 	jbd_unlock_bh_journal_head(bh);
+#ifdef PROACTIVE_SHADOWING_PAGE
+        jh->b_hot = 0;
+#endif  
 	if (new_jh)
 		journal_free_journal_head(new_jh);
 	return bh->b_private;

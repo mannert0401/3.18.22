@@ -133,6 +133,25 @@ struct fs_struct;
 struct perf_event_context;
 struct blk_plug;
 struct filename;
+ 
+/* [NHJ] UFS: epoch structure */
+struct epoch {
+        struct task_struct *task;
+        struct request_queue *q;
+        
+        unsigned int barrier;
+        
+        unsigned int pending;
+        unsigned int dispatch;
+        unsigned int complete;
+        unsigned int error;
+        unsigned int error_flags;
+ 
+        atomic_t e_count;
+ 
+        //struct list_head list;
+};
+
 
 #define VMACACHE_BITS 2
 #define VMACACHE_SIZE (1U << VMACACHE_BITS)
@@ -1661,6 +1680,18 @@ struct task_struct {
 	unsigned int	sequential_io;
 	unsigned int	sequential_io_avg;
 #endif
+
+        /* [NHJ] UFS: epoch structure for task */
+        struct epoch *epoch;
+        struct epoch *__epoch;
+        unsigned int barrier_fail;
+        unsigned int epoch_fail;
+        //struct list_head epoch_pending;
+        //struct list_head epoch_dispatch;
+        //struct list_head epoch_complte;
+        //struct list_head epoch_error;
+
+
 };
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */
