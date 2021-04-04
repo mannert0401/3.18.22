@@ -2219,21 +2219,63 @@ static int ext4_add_nondir(handle_t *handle,
  * If the create succeeds, we fill in the inode information
  * with d_instantiate().
  */
+//#define DEBUG_EXT4_CREATE
+#ifdef DEBUG_EXT4_CREATE
+s64 intv_ext4_create[160];
+int count_ext4_create[40];
+#endif
 static int ext4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 		       bool excl)
 {
 	handle_t *handle;
 	struct inode *inode;
 	int err, credits, retries = 0;
+#ifdef DEBUG_EXT4_CREATE
+	ktime_t start,end;
+	s64 temp_intv[4];
+	int count = 0;
+	int pid = current->pid % 40;
+	int i =0;
+	int retry_flag = 0;
+
+	start = ktime_get();
+#endif
 
 	dquot_initialize(dir);
 
 	credits = (EXT4_DATA_TRANS_BLOCKS(dir->i_sb) +
 		   EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3);
+
+#ifdef DEBUG_EXT4_CREATE
+	if (retry_flag == 0) {
+		end = ktime_get();
+		temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
+
 retry:
 	inode = ext4_new_inode_start_handle(dir, mode, &dentry->d_name, 0,
 					    NULL, EXT4_HT_DIR, credits);
+#ifdef DEBUG_EXT4_CREATE
+	if (retry_flag == 0) {
+		end = ktime_get();
+		temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
 	handle = ext4_journal_current_handle();
+#ifdef DEBUG_EXT4_CREATE
+	if (retry_flag == 0) {
+		end = ktime_get();
+		temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
+
 	err = PTR_ERR(inode);
 	if (!IS_ERR(inode)) {
 		inode->i_op = &ext4_file_inode_operations;
@@ -2245,8 +2287,39 @@ retry:
 	}
 	if (handle)
 		ext4_journal_stop(handle);
-	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries))
+	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries)) {
+#ifdef DEBUG_EXT4_CREATE
+		retry_flag = 0;
+#endif
 		goto retry;
+	}
+#ifdef DEBUG_EXT4_CREATE
+	if (retry_flag == 0) {
+		end = ktime_get();
+		temp_intv[3] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+	}
+
+	if (count == 4) {
+		count_ext4_create[pid]++;
+		for (i = 0; i < 4; i++) {
+			intv_ext4_create[4*pid+i] += temp_intv[i];
+		}
+
+		if (count_ext4_create[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu %llu\n", __func__, 
+				pid, count_ext4_create[pid],
+				intv_ext4_create[4*pid], intv_ext4_create[4*pid+1],
+				intv_ext4_create[4*pid+2], intv_ext4_create[4*pid+3]);
+			count_ext4_create[pid] = 0;
+			intv_ext4_create[4*pid] = 0;
+			intv_ext4_create[4*pid+1] = 0;
+			intv_ext4_create[4*pid+2] = 0;
+			intv_ext4_create[4*pid+3] = 0;
+		}
+	}
+#endif
+
 	return err;
 }
 

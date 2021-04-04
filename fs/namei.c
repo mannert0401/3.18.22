@@ -2884,6 +2884,11 @@ out_dput:
 /*
  * Handle the last step of open()
  */
+//#define DEBUG_CREATE
+#ifdef DEBUG_CREATE
+s64 intv_create[160];
+int count_create[40];
+#endif
 static int do_last(struct nameidata *nd, struct path *path,
 		   struct file *file, const struct open_flags *op,
 		   int *opened, struct filename *name)
@@ -2898,7 +2903,18 @@ static int do_last(struct nameidata *nd, struct path *path,
 	struct path save_parent = { .dentry = NULL, .mnt = NULL };
 	bool retried = false;
 	int error;
+#ifdef DEBUG_CREATE
+	ktime_t start, end;
+	int count_flag = 0;
+	int pid = current->pid % 40;
+	s64 temp_intv[4];
+	s64 temp;
+	int i;
+#endif
 
+#ifdef DEBUG_CREATE
+	start = ktime_get();
+#endif
 	nd->flags &= ~LOOKUP_PARENT;
 	nd->flags |= op->intent;
 
@@ -2952,8 +2968,35 @@ retry_lookup:
 		 * dropping this one anyway.
 		 */
 	}
+#ifdef DEBUG_CREATE
+	if (retried == false) {
+		end = ktime_get();
+		temp = ktime_to_ns(ktime_sub(end,start));
+		temp_intv[0] = temp;
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	mutex_lock(&dir->d_inode->i_mutex);
+#ifdef DEBUG_CREATE
+	if (retried == false) {
+		end = ktime_get();
+		temp = ktime_to_ns(ktime_sub(end,start));
+		temp_intv[1] = temp;
+	 	count_flag++;
+		start = ktime_get();
+	}
+#endif
 	error = lookup_open(nd, path, file, op, got_write, opened);
+#ifdef DEBUG_CREATE
+	if (retried == false) {
+		end = ktime_get();
+		temp = ktime_to_ns(ktime_sub(end,start));
+		temp_intv[2] = temp;
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	mutex_unlock(&dir->d_inode->i_mutex);
 
 	if (error <= 0) {
@@ -3090,6 +3133,31 @@ out:
 		mnt_drop_write(nd->path.mnt);
 	path_put(&save_parent);
 	terminate_walk(nd);
+#ifdef DEBUG_CREATE
+	end = ktime_get();
+	temp = ktime_to_ns(ktime_sub(end,start));
+	temp_intv[3] = temp;
+	count_flag++;
+
+	if (count_flag == 4) {
+		count_create[pid]++;
+		for (i = 0; i < 4; i++) {
+			intv_create[4*pid+i] += temp_intv[i];
+		}
+
+		if (count_create[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu %llu\n", __func__, pid, count_create[pid],
+				intv_create[4*pid], intv_create[4*pid+1],
+				intv_create[4*pid+2], intv_create[4*pid+3]);
+			count_create[pid] = 0;
+			intv_create[4*pid] = 0;
+			intv_create[4*pid+1] = 0;
+			intv_create[4*pid+2] = 0;
+			intv_create[4*pid+3] = 0;
+		}
+	}
+
+#endif
 	return error;
 
 exit_dput:
@@ -3179,7 +3247,11 @@ out:
 	path_put(&nd->path);
 	return error;
 }
-
+//#define DEBUG_OPENAT
+#ifdef DEBUG_OPENAT
+s64 openat_intv[40];
+int openat_count[40];
+#endif
 static struct file *path_openat(int dfd, struct filename *pathname,
 		struct nameidata *nd, const struct open_flags *op, int flags)
 {
@@ -3188,6 +3260,11 @@ static struct file *path_openat(int dfd, struct filename *pathname,
 	struct path path;
 	int opened = 0;
 	int error;
+#ifdef DEBUG_OPENAT
+	ktime_t start;
+	ktime_t end;
+	pid_t pid = current->pid % 40;
+#endif
 
 	file = get_empty_filp();
 	if (IS_ERR(file))
@@ -3208,8 +3285,24 @@ static struct file *path_openat(int dfd, struct filename *pathname,
 	error = link_path_walk(pathname->name, nd);
 	if (unlikely(error))
 		goto out;
-
+#ifdef DEBUG_OPENAT
+	start = ktime_get();
+#endif
 	error = do_last(nd, &path, file, op, &opened, pathname);
+#ifdef DEBUG_OPENAT
+	if (error == 0) {
+		end = ktime_get();
+		openat_intv[pid] += ktime_to_ns(ktime_sub(end,start));
+		openat_count[pid]++;
+
+		if (openat_count[pid] == 1000) {
+			printk("[%s] %d %d %llu\n", __func__, 
+			pid, openat_count[pid], openat_intv[pid]);
+			openat_count[pid] = 0;
+			openat_intv[pid] = 0;
+		}
+	}
+#endif
 	while (unlikely(error > 0)) { /* trailing symlink */
 		struct path link = path;
 		void *cookie;

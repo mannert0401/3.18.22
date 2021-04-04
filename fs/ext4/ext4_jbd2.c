@@ -58,23 +58,82 @@ static int ext4_journal_check_start(struct super_block *sb)
 	}
 	return 0;
 }
-
+//#define DEBUG_JOURNAL_START_SB
+#ifdef DEBUG_JOURNAL_START_SB
+s64 intv_journal_start_sb[120];
+int count_journal_start_sb[40];
+#endif
 handle_t *__ext4_journal_start_sb(struct super_block *sb, unsigned int line,
 				  int type, int blocks, int rsv_blocks)
 {
 	journal_t *journal;
 	int err;
+#ifdef DEBUG_JOURNAL_START_SB
+	ktime_t start,end;
+	s64 temp_intv[3];
+	int count_flag = 0;
+	int pid = current->pid % 40;
+	int i = 0;
+	int retried = 0;
+	handle_t *handle;
+
+	start = ktime_get();
+#endif
 
 	trace_ext4_journal_start(sb, blocks, rsv_blocks, _RET_IP_);
+#ifdef DEBUG_JOURNAL_START_SB
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	err = ext4_journal_check_start(sb);
 	if (err < 0)
 		return ERR_PTR(err);
-
+#ifdef DEBUG_JOURNAL_START_SB
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	journal = EXT4_SB(sb)->s_journal;
 	if (!journal)
 		return ext4_get_nojournal();
+#ifdef DEBUG_JOURNAL_START_SB
+	handle = jbd2__journal_start(journal, blocks, rsv_blocks, GFP_NOFS,
+				   type, line);
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+	}
+
+	if (count_flag == 3) {
+		count_journal_start_sb[pid]++;
+		for (i = 0; i < 3; i++) {
+			intv_journal_start_sb[3*pid+i] += temp_intv[i];
+		}
+
+		if (count_journal_start_sb[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu\n", __func__,
+				pid, count_journal_start_sb[pid],
+				intv_journal_start_sb[3*pid], intv_journal_start_sb[3*pid+1],
+				intv_journal_start_sb[3*pid+2]);
+			count_journal_start_sb[pid] = 0;
+			intv_journal_start_sb[3*pid] = 0;
+			intv_journal_start_sb[3*pid+1] = 0;
+			intv_journal_start_sb[3*pid+2] = 0;
+		}
+	}
+	return handle;
+#else
 	return jbd2__journal_start(journal, blocks, rsv_blocks, GFP_NOFS,
 				   type, line);
+#endif
 }
 
 int __ext4_journal_stop(const char *where, unsigned int line, handle_t *handle)

@@ -708,6 +708,11 @@ out:
  * For other inodes, search forward from the parent directory's block
  * group to find a free inode.
  */
+//#define DEBUG_EXT4_INODE
+#ifdef DEBUG_EXT4_INODE
+s64 intv_create_inode[160];
+int count_create_inode[40];
+#endif
 struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 			       umode_t mode, const struct qstr *qstr,
 			       __u32 goal, uid_t *owner, int handle_type,
@@ -727,7 +732,15 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 	ext4_group_t i;
 	ext4_group_t flex_group;
 	struct ext4_group_info *grp;
+#ifdef DEBUG_EXT4_INODE
+	ktime_t start,end;
+	s64 temp_intv[4];
+	int count_flag = 0;
+	int pid = current->pid % 40;
+	int x = 0;
+	int retried = 0;
 
+#endif
 	/* Cannot create files in a deleted directory */
 	if (!dir || !dir->i_nlink)
 		return ERR_PTR(-EPERM);
@@ -779,12 +792,25 @@ got_group:
 	if (ret2 == -1)
 		goto out;
 
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	/*
 	 * Normally we will only go through one pass of this loop,
 	 * unless we get unlucky and it turns out the group we selected
 	 * had its last inode grabbed by someone else.
 	 */
 	for (i = 0; i < ngroups; i++, ino = 0) {
+
+#ifdef DEBUG_EXT4_INODE
+	if (retried == 0) 
+		start = ktime_get();
+#endif
 		err = -EIO;
 
 		gdp = ext4_get_group_desc(sb, group, &group_desc_bh);
@@ -807,7 +833,14 @@ got_group:
 				group = 0;
 			continue;
 		}
-
+#ifdef DEBUG_EXT4_INODE
+		if (retried == 0) {
+			end = ktime_get();
+			temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+			count_flag++;
+			start = ktime_get();
+		}
+#endif
 		brelse(inode_bitmap_bh);
 		inode_bitmap_bh = ext4_read_inode_bitmap(sb, group);
 		/* Skip groups with suspicious inode tables */
@@ -816,7 +849,6 @@ got_group:
 				group = 0;
 			continue;
 		}
-
 repeat_in_this_group:
 		ino = ext4_find_next_zero_bit((unsigned long *)
 					      inode_bitmap_bh->b_data,
@@ -833,11 +865,32 @@ repeat_in_this_group:
 			ino++;
 			goto next_inode;
 		}
+
 		if (!handle) {
 			BUG_ON(nblocks <= 0);
+#ifdef DEBUG_EXT4_INODE
+			if (retried == 0) {
+				end = ktime_get();
+				temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+				count_flag++;
+				start = ktime_get();
+			}
+#endif
+			current->create_flag = 1;
 			handle = __ext4_journal_start_sb(dir->i_sb, line_no,
 							 handle_type, nblocks,
 							 0);
+			current->create_flag = 0;
+
+#ifdef DEBUG_EXT4_INODE
+			if (retried == 0) {
+				end = ktime_get();
+				temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+				count_flag++;
+				start = ktime_get();
+			}
+#endif
+
 			if (IS_ERR(handle)) {
 				err = PTR_ERR(handle);
 				ext4_std_error(sb, err);
@@ -854,8 +907,35 @@ repeat_in_this_group:
 		ret2 = ext4_test_and_set_bit(ino, inode_bitmap_bh->b_data);
 		ext4_unlock_group(sb, group);
 		ino++;		/* the inode bitmap is zero-based */
-		if (!ret2)
+		if (!ret2) {
+#ifdef DEBUG_EXT4_INODE
+			if (retried == 0) {
+				end = ktime_get();
+				temp_intv[3] = ktime_to_ns(ktime_sub(end,start));
+				count_flag++;
+				start = ktime_get();
+			}
+			if (count_flag == 4) {
+				count_create_inode[pid]++;
+				for (x = 0; x < 4; x++) {
+					intv_create_inode[4*pid+x] += temp_intv[x];
+				}
+	
+				if (count_create_inode[pid] == 1000) {
+					printk("[%s] %d : %d %llu %llu %llu %llu\n", __func__,
+						pid, count_create_inode[pid],
+						intv_create_inode[4*pid],intv_create_inode[4*pid+1],
+						intv_create_inode[4*pid+2],intv_create_inode[4*pid+3]);
+						count_create_inode[pid] = 0;
+					intv_create_inode[4*pid] = 0;
+					intv_create_inode[4*pid+1] = 0;
+					intv_create_inode[4*pid+2] = 0;
+					intv_create_inode[4*pid+3] = 0;
+				}
+			}
+#endif
 			goto got; /* we grabbed the inode! */
+		}
 next_inode:
 		if (ino < EXT4_INODES_PER_GROUP(sb))
 			goto repeat_in_this_group;
@@ -867,12 +947,30 @@ next_group:
 	goto out;
 
 got:
+
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
+
 	BUFFER_TRACE(inode_bitmap_bh, "call ext4_handle_dirty_metadata");
 	err = ext4_handle_dirty_metadata(handle, NULL, inode_bitmap_bh);
 	if (err) {
 		ext4_std_error(sb, err);
 		goto out;
 	}
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 
 	BUFFER_TRACE(group_desc_bh, "get_write_access");
 	err = ext4_journal_get_write_access(handle, group_desc_bh);
@@ -880,6 +978,14 @@ got:
 		ext4_std_error(sb, err);
 		goto out;
 	}
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[3] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 
 	/* We may have to initialize the block bitmap if it isn't already */
 	if (ext4_has_group_desc_csum(sb) &&
@@ -965,6 +1071,16 @@ got:
 
 	BUFFER_TRACE(group_desc_bh, "call ext4_handle_dirty_metadata");
 	err = ext4_handle_dirty_metadata(handle, NULL, group_desc_bh);
+
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[4] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
+
 	if (err) {
 		ext4_std_error(sb, err);
 		goto out;
@@ -1060,6 +1176,15 @@ got:
 		ei->i_datasync_tid = handle->h_transaction->t_tid;
 	}
 
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[5] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
+
 	err = ext4_mark_inode_dirty(handle, inode);
 	if (err) {
 		ext4_std_error(sb, err);
@@ -1069,6 +1194,38 @@ got:
 	ext4_debug("allocating inode %lu\n", inode->i_ino);
 	trace_ext4_allocate_inode(inode, dir, mode);
 	brelse(inode_bitmap_bh);
+#ifdef DEBUG_CREATE_INODE
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[6] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+
+	if (count_flag == 7) {
+		count_create_inode[pid]++;
+		for (x = 0; x < 7; x++) {
+			intv_create_inode[7*pid+x] += temp_intv[x];
+		}
+
+		if (count_create_inode[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu %llu %llu %llu %llu\n", __func__,
+				pid, count_create_inode[pid],
+				intv_create_inode[7*pid], intv_create_inode[7*pid+1],
+				intv_create_inode[7*pid+2], intv_create_inode[7*pid+3],
+				intv_create_inode[7*pid+4], intv_create_inode[7*pid+5],
+				intv_create_inode[7*pid+6]);
+			count_create_inode[pid] = 0;
+			intv_create_inode[7*pid] = 0;
+			intv_create_inode[7*pid+1] = 0;
+			intv_create_inode[7*pid+2] = 0;
+			intv_create_inode[7*pid+3] = 0;
+			intv_create_inode[7*pid+4] = 0;
+			intv_create_inode[7*pid+5] = 0;
+			intv_create_inode[7*pid+6] = 0;
+		}
+	}
+#endif
 	return ret;
 
 fail_free_drop:

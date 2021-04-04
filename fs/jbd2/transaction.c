@@ -260,7 +260,11 @@ static int add_transaction_credits(journal_t *journal, int blocks,
  * to begin.  Attach the handle to a transaction and set up the
  * transaction's buffer credits.
  */
-
+#define DEBUG_HANDLE
+#ifdef DEBUG_HANDLE
+s64 intv_handle[240];
+int count_handle[40];
+#endif
 static int start_this_handle(journal_t *journal, handle_t *handle,
 			     gfp_t gfp_mask)
 {
@@ -268,6 +272,17 @@ static int start_this_handle(journal_t *journal, handle_t *handle,
 	int		blocks = handle->h_buffer_credits;
 	int		rsv_blocks = 0;
 	unsigned long ts = jiffies;
+#ifdef DEBUG_HANDLE
+	ktime_t start,end;
+	s64 temp_intv[6];
+	int count = 0;
+	int pid = current->pid % 40;
+	int i = 0;
+	int retried = 0;
+	int c_flag = current->create_flag;
+
+	start = ktime_get();
+#endif
 
 	/*
 	 * 1/2 of transaction can be reserved so we can practically handle
@@ -282,6 +297,7 @@ static int start_this_handle(journal_t *journal, handle_t *handle,
 
 	if (handle->h_rsv_handle)
 		rsv_blocks = handle->h_rsv_handle->h_buffer_credits;
+
 
 alloc_transaction:
 	if (!journal->j_running_transaction) {
@@ -302,6 +318,15 @@ alloc_transaction:
 			return -ENOMEM;
 		}
 	}
+
+#ifdef DEBUG_HANDLE
+	if (retried == 0 && c_flag == 1) {
+		end = ktime_get();
+		temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
 
 	jbd_debug(3, "New handle %p going live.\n", handle);
 
@@ -333,8 +358,10 @@ repeat:
 
 	if (!journal->j_running_transaction) {
 		read_unlock(&journal->j_state_lock);
-		if (!new_transaction)
+		if (!new_transaction) {
+			retried = 1;
 			goto alloc_transaction;
+		}
 		write_lock(&journal->j_state_lock);
 		if (!journal->j_running_transaction &&
 		    (handle->h_reserved || !journal->j_barrier_count)) {
@@ -347,10 +374,28 @@ repeat:
 
 	transaction = journal->j_running_transaction;
 
+#ifdef DEBUG_HANDLE
+	if (retried == 0 && c_flag == 1) {
+		end = ktime_get();
+		temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
 	if (!handle->h_reserved) {
 		/* We may have dropped j_state_lock - restart in that case */
-		if (add_transaction_credits(journal, blocks, rsv_blocks))
+		if (add_transaction_credits(journal, blocks, rsv_blocks)) {
+			retried = 1;
 			goto repeat;
+		}
+#ifdef DEBUG_HANDLE
+		if (retried == 0 && c_flag == 1) {
+			end = ktime_get();
+			temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+			count++;
+			start = ktime_get();
+		}
+#endif
 	} else {
 		/*
 		 * We have handle reserved so we are allowed to join T_LOCKED
@@ -360,6 +405,14 @@ repeat:
 		sub_reserved_credits(journal, blocks);
 		handle->h_reserved = 0;
 	}
+#ifdef DEBUG_HANDLE
+	if (retried == 0 && c_flag == 1) {
+		end = ktime_get();
+		temp_intv[3] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
 
 	/* OK, account for the buffers that this operation expects to
 	 * use and add the handle to the running transaction. 
@@ -378,7 +431,44 @@ repeat:
 	current->journal_info = handle;
 
 	lock_map_acquire(&handle->h_lockdep_map);
+#ifdef DEBUG_HANDLE
+	if (retried == 0 && c_flag == 1) {
+		end = ktime_get();
+		temp_intv[4] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+#endif
 	jbd2_journal_free_transaction(new_transaction);
+#ifdef DEBUG_HANDLE
+	if (retried == 0 && c_flag == 1) {
+		end = ktime_get();
+		temp_intv[5] = ktime_to_ns(ktime_sub(end,start));
+		count++;
+		start = ktime_get();
+	}
+
+	if (count == 6) {
+		count_handle[pid]++;
+		for (i = 0; i < 6; i++) {
+			intv_handle[6*pid+i] += temp_intv[i];
+		}
+
+		if (count_handle[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu %llu %llu %llu\n", __func__, pid, count_handle[pid],
+				intv_handle[6*pid], intv_handle[6*pid+1],
+				intv_handle[6*pid+2], intv_handle[6*pid+3],
+				intv_handle[6*pid+4], intv_handle[6*pid+5]);
+			count_handle[pid] = 0;
+			intv_handle[6*pid] = 0;
+			intv_handle[6*pid+1] = 0;
+			intv_handle[6*pid+2] = 0;
+			intv_handle[6*pid+3] = 0;
+			intv_handle[6*pid+4] = 0;
+			intv_handle[6*pid+5] = 0;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -418,12 +508,27 @@ static handle_t *new_handle(int nblocks)
  * Return a pointer to a newly allocated handle, or an ERR_PTR() value
  * on failure.
  */
+//#define DEBUG_JOURNAL_START
+#ifdef DEBUG_JOURNAL_START
+s64 intv_journal_start[120];
+int count_journal_start[40];
+#endif
 handle_t *jbd2__journal_start(journal_t *journal, int nblocks, int rsv_blocks,
 			      gfp_t gfp_mask, unsigned int type,
 			      unsigned int line_no)
 {
 	handle_t *handle = journal_current_handle();
 	int err;
+#ifdef DEBUG_JOURNAL_START
+	ktime_t start,end;
+	s64 temp_intv[3];
+	int count_flag = 0;
+	int pid = current->pid % 40;
+	int i = 0;
+	int retried = current->create_flag;
+
+	start = ktime_get();
+#endif
 
 	if (!journal)
 		return ERR_PTR(-EROFS);
@@ -449,8 +554,25 @@ handle_t *jbd2__journal_start(journal_t *journal, int nblocks, int rsv_blocks,
 		rsv_handle->h_journal = journal;
 		handle->h_rsv_handle = rsv_handle;
 	}
-
+#ifdef DEBUG_JOURNAL_START
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[0] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
 	err = start_this_handle(journal, handle, gfp_mask);
+
+#ifdef DEBUG_JOURNAL_START
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[1] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+#endif
+
 	if (err < 0) {
 		if (handle->h_rsv_handle)
 			jbd2_free_handle(handle->h_rsv_handle);
@@ -462,6 +584,31 @@ handle_t *jbd2__journal_start(journal_t *journal, int nblocks, int rsv_blocks,
 	trace_jbd2_handle_start(journal->j_fs_dev->bd_dev,
 				handle->h_transaction->t_tid, type,
 				line_no, nblocks);
+#ifdef DEBUG_JOURNAL_START
+	if (retried == 0) {
+		end = ktime_get();
+		temp_intv[2] = ktime_to_ns(ktime_sub(end,start));
+		count_flag++;
+		start = ktime_get();
+	}
+	if (count_flag == 3) {
+		count_journal_start[pid]++;
+		for (i = 0; i < 3; i++) {
+			intv_journal_start[3*pid+i] += temp_intv[i];
+		}
+
+		if (count_journal_start[pid] == 1000) {
+			printk("[%s] %d : %d %llu %llu %llu\n", __func__,
+				pid, count_journal_start[pid],
+				intv_journal_start[3*pid], intv_journal_start[3*pid+1],
+				intv_journal_start[3*pid+2]);
+			count_journal_start[pid] = 0;
+			intv_journal_start[3*pid] = 0;
+			intv_journal_start[3*pid+1] = 0;
+			intv_journal_start[3*pid+2] = 0;
+		}
+	}
+#endif
 	return handle;
 }
 EXPORT_SYMBOL(jbd2__journal_start);
@@ -776,7 +923,6 @@ int sleep_on_shadow_bh(/*void *word*/ struct wait_bit_key *key)
 EXPORT_SYMBOL_GPL(sleep_on_shadow_bh);
  
 #define CPSETUPWAIT
-
 /*
  * If the buffer is already part of the current transaction, then there
  * is nothing we need to do.  If it is already part of a prior

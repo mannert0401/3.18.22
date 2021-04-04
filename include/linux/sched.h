@@ -1691,6 +1691,7 @@ struct task_struct {
         //struct list_head epoch_complte;
         //struct list_head epoch_error;
 
+	int	create_flag;
 
 };
 
